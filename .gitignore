@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv312/
+venv/
+env/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime databases and logs
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# Captured network traffic
+*.pcap
+*.pcapng
+captures/
+
+# Generated/runtime outputs
+outputs/
+reports/generated/
+tmp/
+temp/
+.cache/
+
+# Large datasets
+data/raw/
+*.parquet
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/

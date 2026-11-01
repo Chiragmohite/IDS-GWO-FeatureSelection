@@ -1,0 +1,2072 @@
+--- a/README.md
++++ b/README.md
+@@ -5,6 +5,19 @@
+ This update preserves the original NSL-KDD pipeline, UNSW-NB15 loader, GWO/bGWO variants, four classifiers, feature extractor and notebooks. It repairs confirmed defects and extends their integration; it is not an unrelated replacement scaffold. See [CHANGES.md](docs/CHANGES.md) and [VERIFICATION.md](docs/VERIFICATION.md).
+ 
+ **Scope:** local, single-analyst academic software. No automatic traffic blocking, internet attack generation, account system or production-grade detection claim. An ML prediction is not proof of an attack.
++
++## Major-project demo
++
++Start with [the demo guide, feature comparison and measured results](docs/MAJOR_PROJECT_GUIDE.md). The new **Research results** workspace displays measured baseline/selected comparisons, convergence charts, feature lists, confusion matrices and downloadable evidence. **Traffic lab** supports real localhost UDP measurement, bounded PCAP analysis and a separate authorized passive collector. Saved Random Forest observations can be explained during investigation.
++
++To launch the optional full-trained, validation-selected 20-feature model with your existing Windows environment:
++
++```powershell
++$env:IDS_MODEL_PROFILE = "compact20"
++.\.venv312\Scripts\python.exe -X faulthandler -m streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501
++```
++
++The original model remains the default. Research thresholds, classifier scores and live alerts are distinct. No profile retrains from incoming observations.
+ 
+ ## Quick start — Windows PowerShell
+ 
+@@ -64,9 +77,11 @@
+ | Events & investigations | Parameterized filters, pagination, feature evidence, incident transitions, notes, audit history and CSV export |
+ | CSV analysis | Validated feature CSV → persisted encoders/scaler → GWO subset → trained classifier → downloadable predictions → optional idempotent event save |
+ | Model lab | Real held-out metrics, confusion matrix, false-positive/negative rates, selected features, feature importance, experiment history and quick training |
++| Research results | Both measured studies, per-class metrics, convergence, evidence downloads, calibration trade-offs and attack-family audits |
++| Traffic lab | Real measured UDP loopback traffic, classic PCAP upload, passive capture instructions and independently labelled event history |
+ | Setup & methodology | Actual commands, paths, permission requirements and research limitations |
+ 
+-No synthetic live counters are displayed. Every event is labelled `live`, `dataset_replay`, `csv_import`, `selftest`, or `legacy`. CSV analysis performs real inference, even when using the supplied benchmark sample. Synthetic self-tests validate plumbing and **do not evaluate detection accuracy**.
++No synthetic live counters are displayed. Every event is labelled `live`, `loopback_probe`, `pcap_replay`, `dataset_replay`, `csv_import`, `selftest`, or `legacy`. CSV analysis performs real inference, even when using the supplied benchmark sample. Synthetic self-tests validate plumbing and **do not evaluate detection accuracy**.
+ 
+ ## Experiments
+ 
+@@ -135,6 +150,7 @@
+ | Variable | Default | Purpose |
+ |---|---|---|
+ | `IDS_DB_PATH` | `<project>/logs/alerts.db` | SQLite location; parent directory created automatically |
++| `IDS_MODEL_PROFILE` | `deployment` | Select deployment or the separate compact20 profile |
+ | `IDS_MODEL_DIR` | `<project>/artifacts/deployment` | Trusted model bundle location |
+ | `IDS_DATA_SOURCE` | `presplit` | `presplit` or optional `raw_full` training input |
+ | `IDS_INTERFACE` | `eth0`, with detected fallback | Capture interface; prefer explicit `--iface` |
+--- /dev/null
++++ b/audit_model.py
+@@ -0,0 +1,38 @@
++"""Evaluate the actual saved binary model by labelled attack family; no retraining."""
++import json
++from pathlib import Path
++import numpy as np
++import pandas as pd
++from sklearn.metrics import confusion_matrix
++import config
++import benchmark as bm
++from src.preprocessing.unsw_preprocessing import load_unsw_raw
++from src.runtime.inference import RuntimeInferenceEngine
++
++
++def audit():
++    engine=RuntimeInferenceEngine()
++    _,te,_,_,_,splits=bm.prepare_splits(load_unsw_raw(config.UNSW_TRAIN_PATH),load_unsw_raw(config.UNSW_TEST_PATH),
++                                          fit_limit=4800,validation_limit=1200,seed=42)
++    labels=[];scores=[]
++    for i in range(0,len(te),1000):
++        y,c=engine.predict_many(te.iloc[i:i+1000]);labels.extend(y);scores.extend(c)
++    pred=np.asarray(labels);alerts=(pred==1)&(np.asarray(scores)>=engine.alert_threshold)
++    data=pd.DataFrame({"family":te.attack_cat.astype(str).str.strip().to_numpy(),"truth":te.label.to_numpy(),
++                       "flagged":pred==1,"alerted":alerts})
++    groups=[]
++    for (family,label),g in data.groupby(["family","truth"]):
++        groups.append(dict(family=family,actual_label=int(label),flows=len(g),
++            predicted_attack=int(g.flagged.sum()),model_alerts=int(g.alerted.sum()),
++            predicted_attack_pct=100*g.flagged.mean(),alert_pct=100*g.alerted.mean()))
++    return dict(model_version=engine.schema["model_version"],feature_count=len(engine.selected_features),
++        test_rows=len(te),test_row_index_sha256=splits["row_index_sha256"]["test"],
++        classifier_accuracy_pct=float(np.mean(pred==te.label.to_numpy())*100),
++        confusion_matrix=confusion_matrix(te.label,pred,labels=[0,1]).tolist(),
++        configured_alert_threshold=engine.alert_threshold,groups=groups)
++
++
++if __name__=="__main__":
++    report=audit();out=Path(config.OUTPUT_DIR)/'audits'/(report["model_version"]+".json")
++    out.parent.mkdir(parents=True,exist_ok=True);out.write_text(json.dumps(report,indent=2,allow_nan=False)+"\n")
++    print(out,report["test_rows"],report["classifier_accuracy_pct"])
+--- a/benchmark.py
++++ b/benchmark.py
+@@ -254,4 +254,7 @@
+ 
+ if __name__ == "__main__":
+     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(message)s")
+-    run_benchmark(parse_args())
++    args=parse_args()
++    run_benchmark(args)
++    from evidence import write_pack
++    print(write_pack(Path(args.output)))
+--- /dev/null
++++ b/budget_study.py
+@@ -0,0 +1,116 @@
++"""Research-only fixed-budget GWO, random-subset controls and validation-set alarm thresholds."""
++import argparse
++from datetime import datetime, timezone
++import hashlib
++from pathlib import Path
++import time
++
++import numpy as np
++import pandas as pd
++from sklearn.metrics import confusion_matrix, roc_curve
++from sklearn.model_selection import GroupShuffleSplit
++
++import benchmark as bm
++import config
++from src.gwo.gwo_algorithm import grey_wolf_optimizer
++from src.gwo.feature_selector import GWOFeatureSelector
++from src.models.model_factory import get_model_factory
++from src.preprocessing.unsw_preprocessing import load_unsw_raw
++
++
++def threshold_for_fpr(y, scores, ceiling):
++    if not 0 < ceiling < 1 or set(np.unique(y)) != {0, 1}:
++        raise ValueError("A calibration set with both labels and an FPR target in (0,1) are required.")
++    fpr, tpr, thresholds = roc_curve(y, scores, drop_intermediate=False)
++    feasible = np.flatnonzero(fpr <= ceiling)
++    # Highest recall, then lowest FPR, then highest threshold among ties.
++    j = max(feasible, key=lambda i: (tpr[i], -fpr[i], thresholds[i]))
++    return float(thresholds[j]) if np.isfinite(thresholds[j]) else float(np.nextafter(1., 2.))
++
++
++def policy_metrics(y, scores, threshold):
++    m = confusion_matrix(y, scores >= threshold, labels=[0, 1])
++    tn, fp, fn, tp = map(int, m.ravel())
++    return {"threshold": threshold, "fpr_pct": 100*fp/(tn+fp), "attack_recall_pct": 100*tp/(tp+fn),
++            "accuracy_pct": 100*(tp+tn)/len(y), "confusion_matrix": m.tolist()}
++
++
++def calibration_partition(train, fit, validation, seed):
++    keys = bm.fingerprints(train, config.RUNTIME_FEASIBLE_FEATURES)
++    used = set(bm.fingerprints(fit, config.RUNTIME_FEASIBLE_FEATURES)) | set(bm.fingerprints(validation, config.RUNTIME_FEASIBLE_FEATURES))
++    rest = train.loc[~keys.isin(used)]
++    if len(rest) < 20: raise ValueError("Too few independent groups for calibration.")
++    groups = keys.loc[rest.index]
++    _, held = next(GroupShuffleSplit(n_splits=1, test_size=.1, random_state=seed).split(rest, groups=groups))
++    is_cal = keys.isin(set(groups.iloc[held]))
++    return train.loc[~is_cal], train.loc[is_cal]
++
++
++def run(output, *, budget=20, seeds=(42,43,44), wolves=8, iterations=20, jobs=2):
++    start = time.perf_counter()
++    out = Path(output)
++    if not 1 <= budget <= 35 or not seeds or len(set(seeds)) != len(seeds) or wolves < 3 or iterations < 1 or jobs < 1:
++        raise ValueError("Invalid study settings.")
++    out.mkdir(parents=True, exist_ok=False)
++    pools = {"offline_42": None, "runtime_35": list(config.RUNTIME_FEASIBLE_FEATURES)}
++    paths = [Path(config.UNSW_TRAIN_PATH), Path(config.UNSW_TEST_PATH)]
++    root = Path(__file__).resolve().parent
++    src = [Path(__file__), root/'benchmark.py', root/'config.py', *sorted((root/'src').rglob('*.py'))]
++    protocol = {"study":"budget_v1","gwo_seeds":list(seeds),"split_seed":42,"feature_budget":budget,
++        "wolves":wolves,"iterations":iterations,"search_trees":32,"final_rf":dict(config.RANDOM_FOREST_PARAMS,n_jobs=jobs),
++        "validation_fpr_target":.05,"calibration_group_seed":20261101,"selector":"continuous GWO with top-K rank decoder",
++        "data_sha256":{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in paths},
++        "code_sha256":{str(p.resolve().relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in src}}
++    bm.write_json(out/'protocol.json',protocol)
++    tr,te,fit,val,features,split=bm.prepare_splits(*[load_unsw_raw(str(p)) for p in paths],fit_limit=4800,validation_limit=1200,seed=42)
++    tr,cal=calibration_partition(tr,fit,val,protocol['calibration_group_seed'])
++    pools['offline_42']=features
++    split.update(final_train_rows=len(tr),calibration_rows=len(cal),calibration_index_sha256=hashlib.sha256(np.asarray(cal.index,dtype='<i8').tobytes()).hexdigest())
++    bm.write_json(out/'splits.json',split)
++    xf,xv=bm.transform_pair(fit,val,features)
++    base=get_model_factory("random_forest")
++    candidates=[]; trace=[]
++    for pool,names in pools.items():
++        indices=[features.index(n) for n in names]
++        candidates.append((pool,'baseline',None,list(names)))
++        for seed in seeds:
++            selector=GWOFeatureSelector(lambda:base().set_params(n_jobs=jobs,n_estimators=32),xf[:,indices],fit.label.to_numpy(),
++                xv[:,indices],val.label.to_numpy(),list(range(len(names))),alpha=config.FITNESS_ALPHA,beta=config.FITNESS_BETA)
++            def step(i,fitness,score,n):
++                trace.append(dict(pool=pool,seed=seed,iteration=i,fitness=fitness,validation_accuracy_pct=score,features=n))
++            wolf=grey_wolf_optimizer(selector._evaluate_feature_mask,len(names),wolves,iterations,0.,1.,seed,feature_budget=budget,on_iteration=step)
++            chosen=[n for n,bit in zip(names,wolf.features) if bit]
++            assert len(chosen)==budget
++            candidates.append((pool,'ranked GWO',seed,chosen))
++            rng=np.random.default_rng(seed)
++            candidates.append((pool,'random subset',seed,[names[i] for i in sorted(rng.choice(len(names),budget,replace=False))]))
++            print(f"{pool} seed {seed}: {budget} selected, validation {wolf.score:.2f}%",flush=True)
++    bm.write_json(out/'masks.json',candidates)
++    pd.DataFrame(trace).to_csv(out/'convergence.csv',index=False)
++    # Calibration and test transforms fit only on the final training rows.
++    xt,others=bm.transform_pair(tr,pd.concat([cal,te],ignore_index=True),features)
++    xc,xe=others[:len(cal)],others[len(cal):]
++    rows=[]
++    for pool,method,seed,chosen in candidates:
++        indices=[features.index(n) for n in chosen];m=base().set_params(n_jobs=jobs)
++        m.fit(xt[:,indices],tr.label.to_numpy())
++        pos=list(m.classes_).index(1)
++        sc=m.predict_proba(xc[:,indices])[:,pos]
++        threshold=threshold_for_fpr(cal.label,sc,protocol['validation_fpr_target'])
++        st=m.predict_proba(xe[:,indices])[:,pos]
++        row=dict(pool=pool,method=method,seed=seed,feature_count=len(chosen),features=chosen,candidate_features=len(pools[pool]),
++            **bm.evaluate_model(m,xe[:,indices],te.label.to_numpy()),calibration=policy_metrics(cal.label,sc,threshold),
++            calibrated_test=policy_metrics(te.label,st,threshold))
++        rows.append(row)
++        print(pool,method,seed,f"test accuracy {row['accuracy_pct']:.2f}%",flush=True)
++    report=dict(status="completed",protocol=protocol,splits=split,results=rows,duration_seconds=round(time.perf_counter()-start,2))
++    bm.write_json(out/'results.json',report)
++    return report
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--output',default='outputs/benchmarks/budget-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
++    args=p.parse_args();run(args.output)
++    from evidence import write_pack
++    print(write_pack(Path(args.output)))
+--- /dev/null
++++ b/build_candidate.py
+@@ -0,0 +1,85 @@
++"""Build an optional runtime bundle from a completed study, selecting only by validation fitness."""
++import argparse
++import hashlib
++import json
++from datetime import datetime, timezone
++from pathlib import Path
++import time
++
++import joblib
++import numpy as np
++import pandas as pd
++import sklearn
++from sklearn.preprocessing import LabelEncoder
++from sklearn.metrics import classification_report
++import benchmark as bm
++from budget_study import calibration_partition, threshold_for_fpr, policy_metrics
++import config
++from src.models.model_factory import get_model_factory
++from src.evaluation.metrics import compute_binary_confusion_counts
++from src.preprocessing.unsw_preprocessing import load_unsw_raw,bucket_rare_protocols,encode_categoricals,scale_numeric
++
++
++def build(run, dest):
++    if dest.exists():raise FileExistsError("Choose a new model directory; existing bundles are preserved.")
++    start=time.perf_counter();prot=json.loads((run/'protocol.json').read_text())
++    if prot.get('study')!='budget_v1':raise ValueError('Expected a fixed-budget study.')
++    trace=pd.read_csv(run/'convergence.csv')
++    last=trace[(trace.pool=='runtime_35') & (trace.iteration==prot['iterations'])].sort_values(['fitness','seed'],ascending=[False,True])
++    if set(last.seed)!=set(prot['gwo_seeds']) or len(last)!=len(prot['gwo_seeds']):raise ValueError('Incomplete validation evidence.')
++    seed=int(last.iloc[0].seed)
++    masks=json.loads((run/'masks.json').read_text())
++    selected=next(m[3] for m in masks if m[:3]==['runtime_35','ranked GWO',seed])
++    names=list(config.RUNTIME_FEASIBLE_FEATURES)
++    if len(set(selected))!=prot['feature_budget'] or not set(selected)<=set(names):raise ValueError('Invalid selected names.')
++    paths=[Path(config.UNSW_TRAIN_PATH),Path(config.UNSW_TEST_PATH)]
++    if any(hashlib.sha256(p.read_bytes()).hexdigest()!=prot['data_sha256'][p.name] for p in paths):raise ValueError('Data hashes changed.')
++    tr,te,fit,val,_,sp=bm.prepare_splits(*[load_unsw_raw(str(p)) for p in paths],fit_limit=4800,validation_limit=1200,seed=prot['split_seed'])
++    tr,cal=calibration_partition(tr,fit,val,prot['calibration_group_seed'])
++    if set(np.unique(tr.label))!={0,1}:raise ValueError("Binary labels required.")
++    numeric=[n for n in names if n not in config.UNSW_CATEGORICAL_COLUMNS]
++    a,b,rare=bucket_rare_protocols(tr[names],pd.concat([cal[names],te[names]],ignore_index=True),threshold=config.UNSW_PROTO_RARE_THRESHOLD)
++    a,b,enc=encode_categoricals(a,b,config.UNSW_CATEGORICAL_COLUMNS)
++    a,b,scaler=scale_numeric(a,b,numeric)
++    clf=get_model_factory('random_forest')().set_params(**prot['final_rf'])
++    clf.fit(a[selected].to_numpy(),tr.label)
++    prob=clf.predict_proba(b[selected].to_numpy())[:,list(clf.classes_).index(1)]
++    cut=threshold_for_fpr(cal.label,prob[:len(cal)],prot['validation_fpr_target'])
++    if cut<.5 or cut>1:raise ValueError("Calibration policy cannot be represented by the binary alert gate.")
++    predicted=clf.predict(b[selected].to_numpy()[len(cal):]);matrix=policy_metrics(te.label,prob[len(cal):],cut)
++    # Only now inspect final-test evidence; never use its scores to choose a seed.
++    study=json.loads((run/'results.json').read_text())
++    rows=study['results'];matched=next(r for r in rows if (r['pool'],r['method'],r['seed'])==('runtime_35','ranked GWO',seed))
++    base=next(r for r in rows if (r['pool'],r['method'])==('runtime_35','baseline'))
++    if not np.isclose(cut,matched['calibration']['threshold']) or matrix['confusion_matrix']!=matched['calibrated_test']['confusion_matrix'] or not np.isclose(100*np.mean(predicted==te.label),matched['accuracy_pct']):
++        raise ValueError("Rebuilt candidate does not reproduce the frozen study.")
++    dest.mkdir(parents=True,exist_ok=False)
++    joblib.dump(clf,dest/'model.pkl',compress=3)
++    joblib.dump({'categorical_encoders':enc,'rare_proto_values':rare},dest/'encoder.pkl',compress=3)
++    joblib.dump(scaler,dest/'scaler.pkl',compress=3);joblib.dump(LabelEncoder().fit(tr.label),dest/'label_encoder.pkl')
++    sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
++    ver="compact20-"+sha(dest/'model.pkl')[:12]
++    schema=dict(model_version=ver,runtime_feasible_features_in_order=names,categorical_features=config.UNSW_CATEGORICAL_COLUMNS,
++        numeric_features=numeric,selected_features_in_order=selected,classification_mode="binary",alert_threshold=cut,
++        threshold_source="separate training calibration groups",excluded_features=config.UNSW_EXCLUDED_FEATURES)
++    bm.write_json(dest/'feature_schema.json',schema)
++    pd.DataFrame({'feature':selected}).to_csv(dest/'selected_features.csv',index=False)
++    report=dict(model_version=ver,read_only_candidate=True,quick_mode=False,trained_at_utc=datetime.now(timezone.utc).isoformat(),
++        duration_seconds=round(time.perf_counter()-start,2),classifier='random_forest',gwo_variant='ranked GWO (20 features)',
++        random_seed=seed,selection_rule='highest final validation fitness, then smallest seed',baseline_accuracy=base['accuracy_pct'],
++        gwo_selected_accuracy=matched['accuracy_pct'],fit_rows=len(fit),validation_rows=len(val),train_rows=len(tr),calibration_rows=len(cal),
++        test_rows=len(te),removed_test_overlaps=sp['removed_test_overlaps_on_35_features'],selected_features=selected,
++        n_features_selected=len(selected),n_features_total_runtime_feasible=len(names),sklearn_version=sklearn.__version__,
++        binary_metrics=compute_binary_confusion_counts(te.label,predicted),selected_report=classification_report(te.label,predicted,output_dict=True),
++        confusion_matrix=matched['confusion_matrix'],feature_importance=dict(zip(selected,map(float,clf.feature_importances_))),
++        calibration_alert_threshold=cut,held_out_alert_metrics=matrix,study_run=run.name,
++        artifact_sha256={p.name:sha(p) for p in dest.iterdir() if p.name in {'model.pkl','encoder.pkl','scaler.pkl','label_encoder.pkl','feature_schema.json'}})
++    bm.write_json(dest/'training_config.json',report)
++    return report
++
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--study',type=Path,default=Path('outputs/benchmarks/budget-20261101'))
++    parser.add_argument('--output',type=Path,required=True);args=parser.parse_args()
++    r=build(args.study,args.output);print(r['model_version'],r['random_seed'],r['calibration_alert_threshold'],r['held_out_alert_metrics'])
+--- a/config.py
++++ b/config.py
+@@ -245,7 +245,10 @@
+ # --------------------------------------------------------------------------
+ # MODEL ARTIFACTS (for independent, offline-trained, runtime-loaded inference)
+ # --------------------------------------------------------------------------
+-SAVED_MODELS_DIR = os.environ.get("IDS_MODEL_DIR", os.path.join(BASE_DIR, "artifacts", "deployment"))
++MODEL_PROFILE = os.environ.get("IDS_MODEL_PROFILE","deployment")
++if MODEL_PROFILE not in {"deployment","compact20"}:
++    raise ValueError("IDS_MODEL_PROFILE must be deployment or compact20.")
++SAVED_MODELS_DIR = os.environ.get("IDS_MODEL_DIR", os.path.join(BASE_DIR, "artifacts", MODEL_PROFILE))
+ MODEL_PATH = os.path.join(SAVED_MODELS_DIR, "model.pkl")
+ SCALER_PATH = os.path.join(SAVED_MODELS_DIR, "scaler.pkl")
+ ENCODER_PATH = os.path.join(SAVED_MODELS_DIR, "encoder.pkl")
+--- a/dashboard/app.py
++++ b/dashboard/app.py
+@@ -16,7 +16,8 @@
+ 
+ import config
+ from src.runtime.alerting import (init_db, get_summary_stats, query_events, review_event,
+-    review_history, REVIEW_TRANSITIONS, collector_status)
++    review_history, REVIEW_TRANSITIONS, collector_status, EVENT_SOURCES, source_totals)
++from dashboard.labs import research, traffic
+ from src.runtime.artifacts import inspect_bundle
+ from src.runtime.batch import read_csv_bytes, analyze_frame, store_batch
+ from src.runtime.inference import RuntimeInferenceEngine
+@@ -45,7 +46,7 @@
+ with st.sidebar:
+     st.markdown("## ◈ GWO IDS")
+     st.caption("NETWORK DEFENSE / RESEARCH LAB")
+-    page = st.radio("Workspace", ["Overview", "Events & investigations", "CSV analysis", "Model lab", "Setup & methodology"], label_visibility="collapsed")
++    page = st.radio("Workspace", ["Overview", "Events & investigations", "CSV analysis", "Model lab", "Research results", "Traffic lab", "Setup & methodology"], label_visibility="collapsed")
+     st.divider()
+     st.caption("LOCAL ANALYST WORKSTATION")
+     st.write("Grey Wolf Optimization + machine learning")
+@@ -104,17 +105,22 @@
+         with left:
+             st.subheader("Recent activity")
+             if rows:
+-                frame = pd.DataFrame(rows)
+-                frame["hour"] = pd.to_datetime(frame.timestamp, utc=True).dt.floor("h")
+-                trend = frame.groupby(["hour", "prediction"]).size().unstack(fill_value=0)
+-                st.bar_chart(trend, color=["#db765d", "#0b8a87"] if len(trend.columns) == 2 else "#0b8a87")
++                # Avoid pandas native datetime conversion on concurrent Windows reruns.
++                from src.runtime.alerting import hourly_counts
++                buckets, invalid = hourly_counts(rows)
++                if buckets:
++                    trend = pd.DataFrame.from_dict(buckets,orient="index").fillna(0).sort_index()
++                    st.bar_chart(trend,color=["#db765d","#0b8a87"] if len(trend.columns)==2 else "#0b8a87")
++                if invalid:
++                    st.caption(f"{invalid} records had an unreadable timestamp and were omitted from the chart.")
+                 st.caption(f"Recent {len(rows)} of {count} records; grouped by UTC hour.")
+             else:
+                 st.info("Your activity chart will appear after observations are stored.")
+         with right:
+             st.subheader("Observation provenance")
+-            if rows:
+-                st.dataframe(pd.DataFrame(rows).groupby("source").size().rename("rows"), width="stretch")
++            totals = source_totals()
++            if totals:
++                st.dataframe(pd.Series(totals,name="All stored flows"),width="stretch")
+             st.caption("Dataset replay is an offline demonstration; it never means an attack is happening on this machine.")
+         st.subheader("Latest alerts")
+         alerts, _ = query_events(limit=10, only_alerts=True)
+@@ -126,7 +132,7 @@
+          "Filter observations, inspect features and record a review. A model alert alone is not proof of an intrusion.")
+     c1, c2, c3 = st.columns(3)
+     prediction = c1.selectbox("Prediction", ["all", "attack", "normal"])
+-    source = c2.selectbox("Source", ["all", "live", "dataset_replay", "csv_import", "selftest", "legacy"])
++    source = c2.selectbox("Source", ["all", *EVENT_SOURCES])
+     state = c3.selectbox("Review state", ["all", *REVIEW_TRANSITIONS])
+     only_alerts = st.checkbox("Only alerts", value=True)
+     page_number = st.number_input("Page (50 records per page)", min_value=1, value=1, step=1)
+@@ -142,7 +148,7 @@
+         record = next(r for r in rows if r["id"] == chosen)
+         st.subheader(f"Observation #{chosen}")
+         st.write({"Prediction": record["prediction"], "Confidence": record["confidence"],
+-                  "Source": record["source"], "Model version": record["model_version"]})
++                  "Source": record["source"], "Observed at (UTC)": record.get("observed_at"), "Saved at (UTC)": record["timestamp"], "Batch": record.get("batch_id"), "Model version": record["model_version"]})
+         with st.expander("Feature evidence"):
+             st.json(json.loads(record["features_json"] or "{}"))
+         if record["is_alert"]:
+@@ -164,6 +170,14 @@
+                 st.caption("No review has been recorded yet.")
+         else:
+             st.caption("This observation did not cross the configured alert threshold.")
++        if st.button("Explain this prediction",key=f"explain_{chosen}"):
++            from src.runtime.explain import explain_observation
++            try:
++                detail=explain_observation(RuntimeInferenceEngine(),record)
++                st.write(f"Forest base attack score: {detail['base']:.1%} → this flow: {detail['score']:.1%}.")
++                st.dataframe(pd.DataFrame(detail['contributions']),hide_index=True,width="stretch")
++                st.caption("Signed changes along the trained trees' decision paths. They describe this model's score; they do not establish a cause or confirm an intrusion.")
++            except (ValueError,RuntimeError,OSError,KeyError) as exc:st.info(str(exc))
+ 
+ elif page == "CSV analysis":
+     hero("Offline analysis", "From flow data to inspectable predictions.",
+@@ -238,7 +252,9 @@
+         st.download_button("Download experiment report", json.dumps(report, indent=2), "experiment.json", "application/json")
+     st.subheader("Run a reproducible experiment")
+     st.caption("Quick training uses 3,000 training / up to 1,000 independent test rows, 4 wolves and 3 iterations. Stop the collector before retraining.")
+-    if st.button("Train quick GWO model", type="primary"):
++    if report and report.get("read_only_candidate"):
++        st.caption(f"Compact profile · {report['train_rows']:,} training rows · {report['calibration_rows']:,} calibration rows · alert threshold {report['calibration_alert_threshold']:.3f}.")
++    if st.button("Train quick GWO model", type="primary",disabled=bool(report and report.get("read_only_candidate"))):
+         try:
+             from train import run_training
+             with st.spinner("Training and evaluating on the supplied benchmark…"):
+@@ -257,6 +273,10 @@
+         st.dataframe(pd.DataFrame(run_rows), hide_index=True, width="stretch")
+         st.caption("Repeated experiments on the same final split must not be used to select a winning model and then claim an unbiased test result.")
+ 
++elif page == "Research results":
++    research(ROOT)
++elif page == "Traffic lab":
++    traffic()
+ else:
+     hero("Project guide", "A research project you can explain.",
+          "The original GWO feature-selection and classification pipeline remains the core. This console adds reproducibility, investigation and a practical demonstration workflow.")
+--- /dev/null
++++ b/dashboard/labs.py
+@@ -0,0 +1,125 @@
++"""Research evidence and traffic workspaces for the existing local Streamlit console."""
++import json
++from pathlib import Path
++import sqlite3
++import zipfile
++
++import pandas as pd
++import streamlit as st
++import config
++from evidence import comparison, convergence, read_run
++from src.runtime.alerting import collector_status, source_totals
++from src.runtime.inference import RuntimeInferenceEngine
++from src.runtime.traffic_lab import analyze_pcap, loopback_probe, persist
++
++
++def research(root):
++    st.title("Research results")
++    st.write("Compare feature selection on the same held-out network flows. These experiments do not replace the active dashboard model.")
++    base=root/"outputs"/"benchmarks"
++    runs=sorted((p for p in base.glob('*') if p.is_dir() and not p.is_symlink() and (p/'results.json').is_file()),reverse=True)
++    runs.sort(key=lambda p:not p.name.startswith("budget-"))  # current demo study first
++    if not runs:
++        st.info("No completed research runs yet. Run benchmark.py or budget_study.py.");return
++    run=st.selectbox("Completed experiment",runs,format_func=lambda p:p.name)
++    try:
++        report=read_run(run);table=comparison(report);curves=convergence(run)
++    except (ValueError,KeyError,OSError) as exc:
++        st.error(f"Could not read the completed experiment: {exc}");return
++    sp=report['splits']; pro=report['protocol']
++    a,b,c=st.columns(3);a.metric("Final training flows",f"{sp['final_train_rows']:,}");b.metric("Held-out flows",f"{sp['final_test_rows']:,}")
++    c.metric("GWO iterations",pro['iterations'])
++    if pro.get("study")=="reference_direction_v1":
++        st.warning(f"Screenshot split direction: raw test includes {sp['raw_test_overlaps']:,} overlapping rows. Inspect the deduplicated sensitivity view ({sp['strict_test_rows']:,} flows) before interpreting accuracy.")
++        st.dataframe(pd.DataFrame([{"Pool":r["pool"],"Method":r["method"],"Raw accuracy (%)":r["accuracy_pct"],"Deduplicated accuracy (%)":r["strict_test"]["accuracy_pct"]} for r in report["results"]]).round(2),hide_index=True)
++    else:st.caption(f"Fit/validation for selection: {sp['selection_fit_rows']:,} / {sp['selection_validation_rows']:,} · overlapping test inputs removed: {sp['removed_test_overlaps_on_35_features']:,}.")
++    if 'calibration_rows' in sp:st.caption(f"Separate calibration flows: {sp['calibration_rows']:,}. Only calibration labels set the experimental alert threshold.")
++    st.subheader("Baseline and selected subsets")
++    st.dataframe(table[['pool','method','seed','feature_count','accuracy_pct','normal_f1-score','attack_f1-score','false_positive_rate_pct']].round(3),hide_index=True,width='stretch')
++    st.download_button("Download comparison CSV",table.to_csv(index=False),"comparison_table.csv","text/csv")
++    st.subheader("Inspect a model")
++    rows=report['results'];i=st.selectbox("Model and seed",range(len(rows)),format_func=lambda j:
++        f"{rows[j]['pool']} · {rows[j]['method']}"+(f" · seed {rows[j]['seed']}" if rows[j]['seed'] is not None else ""))
++    row=rows[i];a,b=st.columns(2)
++    with a:
++        st.write("**Confusion matrix**")
++        st.dataframe(pd.DataFrame(row['confusion_matrix'],index=['Actual normal','Actual attack'],columns=['Predicted normal','Predicted attack']),width='stretch')
++    with b:
++        st.write("**Per-class results**")
++        st.dataframe(pd.DataFrame({k:v for k,v in row['classification_report'].items() if isinstance(v,dict)}).T,width='stretch')
++    st.write(f"**{row['feature_count']} of {row['candidate_features']} features**: "+", ".join(row['features']))
++    if row['method'] in ('ranked GWO','bGWO'):
++        sub=curves[(curves.pool==row['pool'])&(curves.seed==row['seed'])].set_index('iteration')
++        st.subheader("GWO convergence");st.line_chart(sub[['fitness']],color='#087c80')
++        st.caption("Fitness uses training-validation records. A flat section means the best score did not improve.")
++    if 'calibrated_test' in row:
++        m=row['calibrated_test'];st.subheader("False alarms versus missed attacks")
++        st.dataframe(pd.DataFrame([{"Policy":"Default classifier","False-positive rate (%)":row['false_positive_rate_pct'],"Attack recall (%)":100*row['attack_recall']},
++            {"Policy":f"Calibration threshold {m['threshold']:.3f}","False-positive rate (%)":m['fpr_pct'],"Attack recall (%)":m['attack_recall_pct']}]).round(2),hide_index=True)
++        st.caption("The 5% calibration target is not a guarantee on new data. The default profile is unchanged; only the optional compact model uses its own calibration threshold.")
++    pack=run/'research_evidence.zip'
++    if pack.is_file():
++        with zipfile.ZipFile(pack) as files:
++            st.download_button("Download comparison Markdown",files.read('comparison_table.md'),"comparison_table.md","text/markdown")
++            st.download_button("Download convergence PNG",files.read('gwo_convergence.png'),"gwo_convergence.png","image/png")
++            if 'data_profile.csv' in files.namelist():
++                with st.expander('Source data and class balance'):
++                    with files.open('data_profile.csv') as f:st.dataframe(pd.read_csv(f),hide_index=True)
++        st.download_button("Download all evidence",pack.read_bytes(),pack.name,"application/zip")
++    else:st.info(f"Generate downloads locally: python evidence.py outputs/benchmarks/{run.name}")
++
++
++    st.subheader("Attack families in the labelled test data")
++    audits=sorted((root/'outputs'/'audits').glob('*.json'))
++    if audits:
++        audit_path=st.selectbox('Audited saved model',audits,format_func=lambda p:p.stem)
++        audit=json.loads(audit_path.read_text())
++        st.caption(f"Saved bundle {audit['model_version']} · {audit['feature_count']} selected features · {audit['test_rows']:,} held-out records. This audit is separate from the research models above.")
++        st.dataframe(pd.DataFrame(audit['groups']).round(2),hide_index=True,width='stretch')
++        st.caption("Family names are reference labels used only for evaluation. The classifier predicts normal/attack, not the name of an attack. On normal rows, predicted_attack_pct is the false-positive rate.")
++    else:st.caption("Run python audit_model.py to evaluate the saved bundle by labelled attack family.")
++
++
++def traffic():
++    st.title("Traffic lab")
++    st.write("Choose where the observations come from. All three paths use the existing trained model. Only the passive collector monitors an adapter.")
++    mode=st.radio("Traffic source",["Local UDP exchange","Recorded PCAP","Passive interface"],horizontal=True)
++    source={"Local UDP exchange":"loopback_probe","Recorded PCAP":"pcap_replay","Passive interface":"live"}[mode]
++    if source=="live":
++        st.write("Run the collector in a separate terminal on a network you own or may monitor. Leave the dashboard running as a normal user.")
++        st.code(r'.\.venv312\Scripts\python.exe realtime.py --list-ifaces',language='powershell')
++        st.code(r'.\.venv312\Scripts\python.exe realtime.py --iface "Wi-Fi" --duration 60',language='powershell')
++        st.caption("Use the exact adapter name printed by the first command. Windows requires Npcap. Supported traffic is IPv4 TCP/UDP.")
++        health=collector_status()
++        if health:st.write({"Last reported status":health['status'],"UTC heartbeat":health['updated_at'],"Details":health['details']})
++        else:st.info("No collector heartbeat recorded.")
++        st.write("Persisted live adapter flows:",source_totals().get("live",0));return
++    inbox="traffic_result_"+source
++    if source=="loopback_probe":
++        st.write("Send and receive benign UDP datagrams between two temporary sockets on this computer. Measures actual traffic without Npcap; not a passive capture or an attack test.")
++        count=st.number_input("Number of exchanges",min_value=1,max_value=25,value=4)
++        start=st.button("Measure local traffic",type="primary")
++    else:
++        st.write("Analyze an authorized, time-ordered classic PCAP. Ethernet or raw IPv4; TCP/UDP only. Up to 10 MiB, 20,000 packets and 1,000 flows. Payloads are not saved.")
++        uploaded=st.file_uploader("Packet capture",type=['pcap','cap'],key='pcap_file')
++        sample=Path(config.BASE_DIR)/"examples"/"teaching_capture.pcap"
++        use_example=st.checkbox("Use the synthetic teaching capture",value=False)
++        if sample.exists():st.download_button("Download teaching PCAP",sample.read_bytes(),sample.name)
++        start=st.button("Analyze recorded capture",type="primary")
++    if start:
++        st.session_state.pop(inbox,None)
++        try:
++            if source=='pcap_replay' and not use_example and not uploaded:raise ValueError("Choose a capture file first.")
++            with st.spinner("Extracting flow measurements and classifying…"):
++                engine=RuntimeInferenceEngine()
++                batch=loopback_probe(engine,int(count)) if source=='loopback_probe' else analyze_pcap(sample.read_bytes() if use_example else uploaded.getvalue(),engine)
++                st.session_state[inbox]=batch
++        except (OSError,ValueError,RuntimeError,KeyError) as exc:st.error(str(exc))
++    if inbox in st.session_state:
++        batch=st.session_state[inbox];st.write({"Source":source,"Model":batch['version'],**batch['stats']})
++        st.dataframe(pd.concat([pd.DataFrame(batch['metadata']),batch['results']],axis=1),hide_index=True,width='stretch')
++        if st.button("Save measured flows",key="save_"+source):
++            try:
++                n=persist(batch);st.success(f"Saved {n} observations." if n else "Already saved; no duplicate observations.")
++            except (OSError,ValueError,sqlite3.Error) as exc:st.error(str(exc))
++        st.caption("Predicted attack is a model output. These flows are not labelled attack examples.")
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -1,6 +1,8 @@
+ # Architecture and implementation boundaries
+ 
+ The existing Python / scikit-learn / Streamlit / SQLite stack is retained. There is no new parallel detector, web API or authentication model.
++
++The optional compact20 bundle is rebuilt from the validation-selected runtime mask, then carries its own calibration alert threshold. CSV, probe, PCAP and live capture use the same saved inference engine. Flow observation time and event storage time are separate; PCAP and probe imports use atomic batch tokens. The probe uses local sockets, the passive collector requires a supported adapter, and PCAP reads headers without capture privileges. Research exports and per-family audits read completed measurements; they do not promote models automatically.
+ 
+ `benchmark.py` is an isolated research entry point, not a second runtime detector. It reuses the existing UNSW preprocessing, RF factory and GWO selector. It shares rows across 42-feature and 35-feature comparisons, groups selection fit/validation by 35-feature input hashes, and excludes overlapping test inputs regardless of label. After all masks are fixed, it refits preprocessing and final classifiers on the full cleaned training partition. It writes reports only to a new benchmark directory; `train.py`, deployment artifacts and event storage retain their existing behavior. See `docs/MATCHED_BENCHMARK.md` for the executed protocol and limitations.
+ 
+--- a/docs/CHANGES.md
++++ b/docs/CHANGES.md
+@@ -1,4 +1,8 @@
+ # Assessment and changes
++
++## Major-project release — 1 November 2026
++
++See [MAJOR_PROJECT_GUIDE.md](MAJOR_PROJECT_GUIDE.md) for the feature-parity audit, real input modes, experiments, model comparison and Windows guide. The existing default model is preserved; the optional compact20 profile is separately trained and versioned. The original project remains a local investigation tool. New event columns are additive. See update-from-v4.patch for source deltas from the previous ZIP; source-changes.patch remains the earlier change record.
+ 
+ ## Matched benchmark and Python 3.12 dashboard verification
+ 
+--- /dev/null
++++ b/docs/MAJOR_PROJECT_GUIDE.md
+@@ -0,0 +1,102 @@
++# GWO IDS: research and live-data demonstration
++
++**Question:** Can a trained Random Forest classify network flows using fewer measurements, and what happens to false alarms and missed attacks? GWO chooses columns during training. The saved classifier predicts on new flows without retraining. Human review determines what an alert means.
++
++## Start and demonstrate (Windows)
++
++Use Python 3.12 and the existing requirements. If this is a fresh extraction, run `scripts/Setup.ps1` or set up a 3.12 environment as described in the README. If you already have a working installation, stop running project processes and back up your folder. Keep your local .venv312, logs/alerts.db and custom model bundles. The release does not contain an event database. Schema upgrades preserve existing records. Start commands below assume PowerShell in the project root.
++
++```powershell
++$env:IDS_MODEL_PROFILE = "compact20"
++.\.venv312\Scripts\python.exe -X faulthandler -m streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501
++```
++
++Open http://127.0.0.1:8501. Keep the terminal running. The optional compact profile is already trained. The original quick-trained model remains the default if IDS_MODEL_PROFILE is unset. An explicit IDS_MODEL_DIR overrides profile selection. To return to the original model, stop the server, set IDS_MODEL_PROFILE to deployment and restart. The profile is shared by CSV, PCAP, probe and collector processes **started in that environment**; set it in each new PowerShell terminal. Quick training is disabled for the packaged compact bundle.
++
++1. **Research results:** choose the fixed-budget experiment. Compare baseline, random subset and ranked GWO across all seeds. Inspect class counts, per-class metrics, both confusion matrices and GWO convergence. Download the Markdown/CSV comparison or complete evidence ZIP. The matched unconstrained experiment is also available.
++2. **Traffic lab → Local UDP exchange:** click *Measure local traffic*. Two temporary localhost sockets actually send/receive UDP datagrams. Inspect measured flows, source, model version and predictions; save to history. These are controlled benign exchanges, not passive monitoring or attack examples. Socket receive time, sender TTL and estimated IPv4+UDP length differ from a packet sniffer's wire-level readings.
++3. **Traffic lab → Recorded PCAP:** upload an authorized classic capture, or select the clearly labelled synthetic teaching fixture. Analyze, inspect and save. Identical capture bytes plus model version are idempotent. Captures require chronological timestamps, Ethernet (up to two VLAN tags) or raw IPv4, TCP/UDP only. Fragments and unsupported/truncated packets are counted as skipped. Payloads are not persisted. Limits: 10 MiB, 20,000 packets, 1,000 flows. PCAPNG and compressed files are unsupported.
++4. **Events & investigations:** filter by input source. Inspect an observation and click *Explain this prediction*. For a matching saved Random Forest, signed tree-path contributions reconstruct the event's attack score from its base score. These are model-specific explanations, not causal evidence. A different model version cannot explain a historical event. Alerts retain the existing review and audit workflow.
++5. **Overview:** compare source totals and activity. Dataset replay, captured files and the loopback probe never mark the passive collector healthy. Observation time and storage time are distinct. The activity chart uses standard-library UTC parsing to avoid the pandas native datetime call that appeared in the Windows crash trace.
++6. **Passive capture, optional:** list adapters, then run a bounded verification on an interface you own or are allowed to monitor. It uses an isolated temporary database and reports success only when the process exits cleanly and stores actual live flows. For your normal dashboard history, run the regular collector in a separate terminal. Generate ordinary authorized traffic on that interface while it runs.
++
++```powershell
++.\.venv312\Scripts\python.exe realtime.py --list-ifaces
++.\.venv312\Scripts\python.exe verify_capture.py --iface "Wi-Fi" --seconds 30
++.\.venv312\Scripts\python.exe realtime.py --iface "Wi-Fi" --duration 60
++```
++
++Windows passive capture requires a working Npcap installation and appropriate permissions. Use the actual interface name printed. Keep the dashboard as a normal user. The probe, PCAP, CSV and replay paths do not need an administrator.
++
++## Comparison with the reference demonstration
++
++| Visible reference capability | Where it is in this release |
++|---|---|
++| UNSW-NB15 loading; train/test shapes and class balance | Research results → Source data and class balance; protocol and splits in evidence pack |
++| Random Forest on all 42 features | Offline-42 baseline in both research studies |
++| GWO search for feature subsets; fitness by iteration | Original GWO/bGWO retained; iteration chart, CSV and PNG exported |
++| Reduced-feature RF, selected feature names and counts | Model inspection; selected_features.txt and selected_features.csv |
++| Normal/attack precision, recall, F1 and support | Per-class report for each model, comparison CSV and report JSON |
++| Baseline and selected confusion matrices | On-screen numeric matrices and individual PNGs in the evidence pack |
++| CSV and Markdown comparison, reproducible outputs | Report downloads and CLI evidence.py; timing fields where recorded |
++| GWO-selected 20 of 42 in the reference run | New fixed-budget comparison enforces exactly 20 of 42 or 20 of 35; selecting 20 is a **specified constraint**, not a discovered optimum |
++
++This maps what was visible in the friend's recording. No claim of identical private code, identical split, unobserved features, or superior accuracy on their exact experiment is made.
++
++## New fixed-budget experiment
++
++Before held-out scoring, the run specified 20 features, two candidate pools, 8 wolves, 20 iterations, optimizer seeds 42/43/44 and a 5% calibration false-positive-rate target. Continuous GWO ranks positions to decode exactly K columns; the existing unconstrained optimizer remains available. Each seeded GWO subset is compared to a seeded, uniformly random subset of the same size and an all-feature baseline. Search uses 32 trees for bounded computation, final models use 150. The objective and splits are fixed across candidate pools.
++
++Raw supplied rows: 175,341 train / 82,332 test. The shared test set contains 53,915 rows after cleaning and overlap removal by the 35 input features without labels. GWO uses 4,800 training-fit and 1,200 validation rows. A separate group-disjoint calibration partition of 10,020 rows is excluded from final fitting; final classifiers fit 97,720 training records. Test outcomes do not choose the seed, features or alert cutoff. This test dataset had been examined in earlier research; it is not a fresh external validation set.
++
++| Pool | All-feature accuracy | Mean random-20 accuracy | Mean GWO-20 accuracy |
++|---|---:|---:|---:|
++| Offline 42 | 82.77% | 82.34% | 82.60% |
++| Runtime 35 | 82.77% | 82.47% | 82.16% |
++
++Means vary only optimizer/random-subset seed on a fixed split. Both GWO means are below the all-feature baseline. GWO beats the random control on average for the 42-feature pool but not for the runtime pool. Results for every seed, including negative comparisons, are in outputs/benchmarks/budget-20261101/. The 5% calibration target did **not** transfer to the test set: runtime GWO models averaged 15.69% test false alerts and 90.51% attack-alert recall at the calibrated cutoff. A lower alert rate can cost recall. No live detection-performance claim follows.
++
++## Reference-direction run: comparison with the photographed setup
++
++An additional run trained on the 82,332-row file and tested on the 175,341-row file using 42 candidate features, matching the **visible file roles and row counts**. It preserves raw row weighting for that comparison. Search used 4,800 fit and 1,200 separate validation rows from training, eight wolves, 20 iterations and seed 42. Both selected models and the baseline used the same final 150-tree RF settings. All selected masks were frozen before final-test scores.
++
++| Model | Features | Raw test accuracy (175,341 rows) | Strict-view accuracy (99,869 rows) |
++|---|---:|---:|---:|
++| All-feature RF | 42 | 90.08% | 85.07% |
++| Original bGWO, unconstrained | 39 | 90.04% | 85.01% |
++| Ranked GWO with fixed budget | 20 | 89.65% | 85.35% |
++
++10,279 raw test rows had feature inputs also found in training. The stricter view excluded training-overlapping inputs and kept one instance per remaining input/label pair. It uses the same trained models with no additional fitting. The friend's screenshots report **90.07% baseline, 88.34% selected, 20 features**. Our raw 20-feature result is numerically higher on the same split sizes, but their exact preprocessing, code, selection objective and RF settings are unknown. The strict numbers are **not** available for their project. No proof of universal or live superiority follows from this comparison.
++
++Inspect the raw and strict views in Research results. To repeat independently, run `python reference_study.py`; it creates a new directory rather than overwriting the delivered run.
++
++## What is actually shipped and scored
++
++The optional compact20 profile was selected by highest final **training-validation fitness** among runtime GWO runs, with smallest seed as tie-breaker. That selects seed 42; it does not select the highest held-out accuracy. The model, encoder, scaler, feature schema, calibrated threshold and hashes are packaged separately under artifacts/compact20. The rebuild checked the frozen study's accuracy, calibration threshold and held-out alert confusion matrix. The existing artifacts/deployment bundle is unchanged.
++
++Both saved bundles were then scored directly on the same held-out 53,915 rows, using their own preprocessing and alert policies:
++
++| Saved bundle | Selected features | Binary accuracy | Normal flows alerted | Attacks alerted |
++|---|---:|---:|---:|---:|
++| Original quick-trained model | 33/35 | 80.26% | 23.23% | 91.22% |
++| Optional compact model | 20/35 | 82.66% | 15.98% | 92.32% |
++
++Binary accuracy uses the classifier's normal/attack prediction. An alert also requires a predicted attack with confidence at least the profile cutoff: 0.60 for the original bundle and 0.67333 for compact20. Therefore classification accuracy is **not** the accuracy of a thresholded alert/no-alert decision. Compact20 alerted on 5,380 of 33,666 normal rows and on 18,694 of 20,249 attack rows. The original quick-run Model lab number of 81.50% used a different, 1,000-row quick test; it should not replace the comparable 80.26% audit above.
++
++The model, amount of training data, selected features and alert policy all differ across these bundles. Do not attribute their difference to GWO alone. Attack-family tables use held-out reference labels for evaluation; the classifier predicts only normal or attack. Live feature definitions approximate several dataset features.
++
++## Reproduce or inspect
++
++```powershell
++.\.venv312\Scripts\python.exe -m pytest -q
++.\.venv312\Scripts\python.exe budget_study.py
++.\.venv312\Scripts\python.exe evidence.py outputs/benchmarks/budget-20261101
++.\.venv312\Scripts\python.exe build_candidate.py --output artifacts/my-new-compact-model
++.\.venv312\Scripts\python.exe audit_model.py
++.\.venv312\Scripts\python.exe traffic.py --probe 5 --save
++.\.venv312\Scripts\python.exe traffic.py --pcap examples/teaching_capture.pcap --save
++```
++
++The build command defaults to the delivered completed study; use --study with a new run to rebuild from it. Output bundle directories must be new. Run audit_model.py with the desired IDS_MODEL_PROFILE. To inspect the export without running experiments, open either research_evidence.zip in outputs/benchmarks/. The dated budget run includes experiment_source.zip containing the source bytes recorded at protocol freeze. Runtime/UI work completed later does not change these recorded metrics.
++
++See VERIFICATION.md for commands, actual results, failures fixed and remaining platform checks.
+--- a/docs/PROJECT_REPORT.md
++++ b/docs/PROJECT_REPORT.md
+@@ -1,4 +1,7 @@
+ # Final-year report and demonstration guide
++
++
++For current research results, the seven-workspace demonstration and the limits of the live check, use [MAJOR_PROJECT_GUIDE.md](MAJOR_PROJECT_GUIDE.md). The previous quick benchmark below is historical.
+ 
+ ## Suggested title
+ 
+--- /dev/null
++++ b/docs/RELEASE_CHECKS.md
+@@ -0,0 +1,18 @@
++# Release checks — 1 November 2026
++
++## Final tests and integration
++
++- Baseline: 61 passed. Full final suite: **80 passed, 0 failed, 0 skipped in 6.85s**, Linux/Python 3.12.14, using the project's pinned dependencies. ResourceWarnings and PytestUnraisableExceptionWarnings treated as errors.
++- Commands: `../../verify-env/bin/python -m pytest -q -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning`; `python -m compileall -q src dashboard tests scripts *.py`; `node --check scripts/browser_smoke.cjs`; `python -m pip check`. Compilation and JavaScript syntax checks succeeded; no broken Python requirements.
++- Tests cover the 42/35 and reference research exports, exact-budget enforcement, calibration group separation, malformed PCAPs and fragmentation, replay-time flow expiration, event source and timestamp preservation, idempotent imports, simultaneous SQLite upgrades, actual socket exchanges, per-observation score reconstruction, correct alert cutoffs, candidate validation selection, frozen-model protection, saved audit matrices, and seven-workspace integration.
++- Actual browser command: `IDS_CHROMIUM_EXECUTABLE=<local Chromium 131 binary> IDS_BROWSER_OUTPUT=<temporary directory> ../../verify-env/bin/python scripts/browser_verify.py`, repeated with `IDS_MODEL_PROFILE=compact20`. Both exited 0. Both verified seven pages, 50 classified CSV flows saved, two concurrent populated sessions and refresh, evidence ZIP download, four actual localhost probe flows and two synthetic-PCAP fixture flows saved, a matching-model explanation, HTTP health 200, zero page errors and no mobile overflow. The reference-direction UI was also verified with AppTest.
++- Default and compact model audits evaluated 53,915 labelled records using the actual saved model pipelines, independently of Model lab's prior quick report. Compact20's rebuilt threshold and alert confusion matrix matched its research run. The default bundle's bytes match v4.
++- Separate CLI runs persisted six real UDP exchanges for the default profile and five for compact20. Each profile also processed and saved two flows from the bounded teaching PCAP. Compact-profile replay stored 100 benchmark observations (63 attack predictions, 58 model alerts); synthetic self-test stored one observation. These are input-path checks, not live attack evaluations.
++- The passive loopback adapter verifier returned exit 1: OS permission denied and zero live rows. Windows/PowerShell and Npcap are not present in this environment. This does not invalidate the verified socket probe or file replay; they use different source labels. Passive verification must be completed on an authorized target machine.
++- Original matched run, new budget run, reference-direction run, and verification/fix details are documented in MAJOR_PROJECT_GUIDE.md and VERIFICATION.md. Results are measured on the supplied data; there is no guarantee of production reliability or superiority over an uninspected code revision.
++
++## Safe upgrades
++
++Back up any local changes and event database before updating an existing installation. Do not remove your .venv312, logs or custom models. The added SQLite columns observed_at and batch_id are nullable and additive, and old rows remain searchable. Copy the new complete source/test directories and compact20 bundle from the ZIP. For clean setup the ZIP can be extracted in a fresh folder; the project expects Python 3.12. The compact model is optional, and the original default remains available.
++
++The supplied model files are models generated for this project. Only load trusted locally trained bundles. A checksum detects mismatching files; it is not a signature authenticating third-party files.
+--- a/docs/VERIFICATION.md
++++ b/docs/VERIFICATION.md
+@@ -1,4 +1,33 @@
+ # Verification actually executed
++
++## Major-project release — November 2026
++
++The earlier sections below describe historical runs. This release was based on the delivered v4 ZIP, not a new scaffold. Isolated project dependencies were installed from requirements-dev.txt in a Python 3.12.14 environment using the matching system numerical libraries (pandas 2.2.3, NumPy 2.3.5, sklearn 1.8.0). No additional application packages.
++
++Commands from the project root (shell interpreter used here: ../../verify-env/bin/python):
++
++```bash
++../../verify-env/bin/python -m pytest -q -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning
++../../verify-env/bin/python budget_study.py --output outputs/benchmarks/budget-20261101
++../../verify-env/bin/python reference_study.py --output outputs/benchmarks/reference-20261101
++../../verify-env/bin/python build_candidate.py --output artifacts/compact20
++../../verify-env/bin/python audit_model.py
++IDS_MODEL_PROFILE=compact20 ../../verify-env/bin/python audit_model.py
++IDS_DB_PATH=/tmp/gwo-verification-20261101.db ../../verify-env/bin/python traffic.py --probe 6 --save
++IDS_DB_PATH=/tmp/gwo-verification-20261101.db ../../verify-env/bin/python traffic.py --pcap examples/teaching_capture.pcap --save
++../../verify-env/bin/python verify_capture.py --iface lo --seconds 3
++../../verify-env/bin/python -m pip check
++```
++
++The baseline was **61 passed in 8.55s**. The first full post-change run exposed eight failures in the single-event SQL insert (a missing column/placeholder for observation time). Fixed the insert; the next full run was **75 passed in 7.29s**. Subsequent tests exercised compact-model selection, alert threshold propagation, model directory protection and concurrent additive schema initialization. See the final validation record in RELEASE_CHECKS.md. Historical Windows tests are not counted as tests of this release.
++
++- Default package: six genuine local UDP exchanges (12 received datagrams) persisted six instrumented observations. The synthetic teaching PCAP yielded two flows from six supported packets; one non-IPv4 frame was skipped. Compact20 was also run on five real local exchanges and the same PCAP. Source totals remain distinct. No payload capture is necessary for the probe.
++- The Scapy-based offline PCAP prototype failed under adapter enumeration restrictions. Replaced only offline parsing with a bounded standard-library header reader; the live path still uses Scapy. Original and compact bundle predictions were exercised with the actual saved preprocessing; CSV batch inference was checked against direct fitted-encoder/estimator results.
++- The passive adapter verifier on Linux **failed** with an OS permission error (no raw socket access). No passive live row was claimed. Windows/Npcap capture and Windows PowerShell wrappers were not run here. Use the isolated verify_capture.py check on the intended Windows PC.
++- The original candidate-independent benchmark and the new budget study evidence archives include real per-seed convergence, per-class results, individual heatmaps, selected names and CSV/Markdown comparisons. The compact model reproduced its corresponding study confusion matrix; alert-level recall is reported separately from binary-classifier accuracy.
++- Real browser checks for both model profiles used an isolated event database, seven workspaces, saved CSV/probe/PCAP predictions, two simultaneous browser sessions, automatic refresh, a research ZIP download, local RF explanation, and a mobile viewport. Chromium 153 could not start in this host; the checks passed with the compatible Chromium 131 runtime. No change to application dependencies was needed.
++- Compilation completed and pip check reported no broken requirements. Windows crash stability is not claimed; the native pandas datetime conversion seen in the trace has been removed from Overview, and the startup scripts now resolve a 3.12 interpreter.
++
+ 
+ ## Matched benchmark follow-up — 31 October 2026
+ 
+--- /dev/null
++++ b/evidence.py
+@@ -0,0 +1,118 @@
++"""Build a reviewable research evidence pack exclusively from completed run records."""
++import argparse
++import hashlib
++import config
++import io
++import json
++import re
++import zipfile
++from pathlib import Path
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++import numpy as np
++import pandas as pd
++
++
++def read_run(folder):
++    report=json.loads((folder/'results.json').read_text(encoding="utf-8"))
++    if report.get("status")!="completed" or not report.get("results"):raise ValueError("No completed evaluation.")
++    for row in report['results']:
++        m=np.asarray(row['confusion_matrix'])
++        if m.shape!=(2,2) or np.any(m<0) or int(m.sum())!=report['splits']['final_test_rows']:
++            raise ValueError("Inconsistent held-out confusion matrix.")
++    return report
++
++
++def convergence(folder):
++    if (folder/'convergence.csv').exists():
++        return pd.read_csv(folder/'convergence.csv')
++    pool=None;pending=[];records=[]
++    for line in (folder/'run.log').read_text(encoding="utf-8").splitlines():
++        if hit:=re.search(r"Starting selection: (\w+)",line):pool=hit[1]
++        if hit:=re.search(r"Iteration (\d+)/\d+ \| best fitness=([.\d]+) score=([.\d]+) n_features=(\d+)",line):
++            pending.append(dict(pool=pool,iteration=int(hit[1]),fitness=float(hit[2]),validation_accuracy_pct=float(hit[3]),features=int(hit[4])))
++        if hit:=re.search(r"Seed (\d+): selected",line):
++            records.extend(dict(seed=int(hit[1]),**r) for r in pending);pending=[]
++    if pending or not records:raise ValueError("Convergence evidence incomplete.")
++    return pd.DataFrame(records)
++
++
++def comparison(report):
++    flat=[]
++    for r in report["results"]:
++        row={k:r[k] for k in ["pool","method","seed","feature_count","candidate_features","accuracy_pct","false_positive_rate_pct","false_negative_rate_pct","roc_auc"]}
++        for cls in ("normal","attack"):
++            for metric in ("precision","recall","f1-score","support"):
++                row[cls+"_"+metric]=r["classification_report"][cls][metric]
++        row.update({k:r[k] for k in ("fit_seconds","predict_seconds","selection_seconds") if k in r})
++        flat.append(row)
++    return pd.DataFrame(flat)
++
++
++def png(fig):
++    out=io.BytesIO()
++    try: fig.savefig(out,format="png",dpi=135,bbox_inches="tight")
++    finally: plt.close(fig)
++    return out.getvalue()
++
++
++def write_pack(folder):
++    report=read_run(folder); curves=convergence(folder);table=comparison(report)
++    expected={(r['pool'],r['seed']) for r in report['results'] if r['method'] in {'ranked GWO','bGWO'}}
++    iterations=report['protocol']['iterations']
++    if set(curves.groupby(['pool','seed']).groups)!=expected or any(sorted(g.iteration)!=list(range(1,iterations+1)) for _,g in curves.groupby(['pool','seed'])):
++        raise ValueError("Missing or duplicate search iterations.")
++    output=folder/'research_evidence.zip'
++    temporary=output.with_suffix('.tmp')
++    with zipfile.ZipFile(temporary,'w',zipfile.ZIP_DEFLATED) as z:
++        z.write(folder/'results.json','results.json')
++        profile=[]
++        data_paths=[Path(config.UNSW_TRAIN_PATH),Path(config.UNSW_TEST_PATH)]
++        if report["protocol"].get("study")=="reference_direction_v1":data_paths.reverse()
++        for role,path in zip(["raw_train","raw_test"],data_paths):
++            if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest()==report['protocol']['data_sha256'].get(path.name):
++                labels=pd.read_csv(path,usecols=['label']).label
++                profile.append(dict(split=role,rows=len(labels),normal=int((labels==0).sum()),attack=int((labels==1).sum()),attack_pct=100*labels.mean()))
++        if profile:z.writestr("data_profile.csv",pd.DataFrame(profile).to_csv(index=False))
++        for n in ['protocol.json','splits.json','selection.json','masks.json','run.log']:
++            if (folder/n).is_file():z.write(folder/n,n)
++        z.writestr('comparison_table.csv',table.to_csv(index=False))
++        z.writestr('gwo_convergence.csv',curves.to_csv(index=False))
++        md=['# UNSW-NB15 experiment comparison','', 'Rows are evaluated on the same held-out flows in this experiment. Seeds vary the optimizer; results are not independent datasets.','',
++            '| Pool | Method | Seed | Features | Accuracy | Normal P/R/F1 | Attack P/R/F1 | FPR |','|---|---|---:|---:|---:|---|---|---:|']
++        features=[]
++        for i,r in enumerate(report['results']):
++            m=np.asarray(r['confusion_matrix']);key=f"{i+1:02d}_{r['pool']}"
++            desc=f"{r['pool']} / {r['method']} / seed {r['seed'] if r['seed'] is not None else '—'}"
++            md.append(f"| {r['pool']} | {r['method']} | {r['seed'] if r['seed'] is not None else '—'} | {r['feature_count']} | {r['accuracy_pct']:.2f}% | {r['classification_report']['normal']['precision']:.3f} / {r['classification_report']['normal']['recall']:.3f} / {r['classification_report']['normal']['f1-score']:.3f} | {r['attack_precision']:.3f} / {r['attack_recall']:.3f} / {r['attack_f1']:.3f} | {r['false_positive_rate_pct']:.2f}% |")
++            features.append(desc+"\n"+", ".join(r['features'])+"\n")
++            fig,ax=plt.subplots(figsize=(5,4));ax.imshow(m,cmap='Blues')
++            for y in range(2):
++                for x in range(2):ax.text(x,y,f'{m[y,x]:,}',ha='center',va='center',color='white' if m[y,x]>m.max()*.55 else 'black')
++            ax.set(xticks=[0,1],yticks=[0,1],xticklabels=['Normal','Attack'],yticklabels=['Normal','Attack'],
++                   xlabel='Predicted class',ylabel='Actual class',title=desc)
++            z.writestr('confusion_matrices/'+key+'.png',png(fig))
++
++        z.writestr('selected_features.csv',pd.DataFrame([{"pool":r["pool"],"method":r["method"],"seed":r["seed"],"feature":f} for r in report["results"] for f in r["features"]]).to_csv(index=False))
++        md.extend(["", f"Experiment duration: {report['duration_seconds']:.1f} seconds."])
++        z.writestr('comparison_table.md',"\n".join(md)+"\n")
++        z.writestr('selected_features.txt',"\n".join(features))
++        fig,axes=plt.subplots(2,1,figsize=(8,6),layout='constrained')
++        for ax,(pool,g) in zip(axes,curves.groupby('pool')):
++            for seed,s in g.groupby('seed'):
++                ax.plot(s.iteration,s.fitness,label=f'seed {int(seed)}')
++            ax.set(xlabel='GWO iteration',ylabel='Best validation fitness',title=pool);ax.legend();ax.grid(alpha=.2)
++        z.writestr('gwo_convergence.png',png(fig))
++        strict=[dict(pool=r["pool"],method=r["method"],raw_accuracy_pct=r["accuracy_pct"],strict_accuracy_pct=r["strict_test"]["accuracy_pct"],
++                     strict_fpr_pct=r["strict_test"]["false_positive_rate_pct"]) for r in report["results"] if "strict_test" in r]
++        if strict:z.writestr("raw_and_deduplicated_test.csv",pd.DataFrame(strict).to_csv(index=False))
++        policies=[{"pool":r['pool'],"method":r['method'],"seed":r['seed'],**{k:v for k,v in r['calibrated_test'].items() if k!='confusion_matrix'}} for r in report['results'] if 'calibrated_test' in r]
++        if policies:z.writestr('validation_threshold_test_results.csv',pd.DataFrame(policies).to_csv(index=False))
++    temporary.replace(output)
++    return output
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser(description=__doc__);p.add_argument("run",type=Path)
++    print(write_pack(p.parse_args().run))
+--- a/realtime.py
++++ b/realtime.py
+@@ -25,6 +25,7 @@
+     sudo python3 realtime.py --iface eth0     # Linux / Kali
+ """
+ 
++from datetime import datetime, timezone
+ import argparse
+ import logging
+ import os
+@@ -142,36 +143,19 @@
+                            "Install Npcap (https://npcap.com) with WinPcap-compatible mode.")
+     elif hasattr(os, "geteuid") and os.geteuid() != 0:
+         logger.warning("Not running as root - raw capture will probably fail. "
+-                       "Use sudo, or setcap cap_net_raw,cap_net_admin=eip on python.")
++                       "Use an authorized capture session or analyze an existing PCAP.")
+ 
+ 
+ def _build_packet_handler(tracker, IP, TCP, UDP):
++    from src.runtime.traffic_lab import packet_fields
+     def handler(pkt):
+         STATS["packets"] += 1
+-        if IP not in pkt:
+-            STATS["skipped_non_ip"] += 1   # ARP, IPv6, ... (schema is IPv4 flows)
+-            return
+-
+-        ip_layer = pkt[IP]
+-        if TCP in pkt:
+-            proto, transport = "tcp", pkt[TCP]
+-        elif UDP in pkt:
+-            proto, transport = "udp", pkt[UDP]
+-        else:
+-            STATS["skipped_other_proto"] += 1  # ICMP (ping) etc. is ignored
++        fields, reason = packet_fields(pkt)
++        if fields is None:
++            STATS["skipped_non_ip" if reason == "non_ipv4" else "skipped_other_proto"] += 1
+             return
+         STATS["ip_tcp_udp"] += 1
+-
+-        tracker.on_packet(
+-            proto=proto,
+-            src_ip=ip_layer.src, src_port=int(transport.sport),
+-            dst_ip=ip_layer.dst, dst_port=int(transport.dport),
+-            length=len(pkt), ttl=int(ip_layer.ttl),
+-            timestamp=float(pkt.time),
+-            tcp_flags=str(pkt[TCP].flags) if TCP in pkt else None,
+-            tcp_seq=int(pkt[TCP].seq) if TCP in pkt else None,
+-            tcp_window=int(pkt[TCP].window) if TCP in pkt else None,
+-        )
++        tracker.on_packet(**fields)
+     return handler
+ 
+ 
+@@ -198,7 +182,9 @@
+     }
+     try:
+         record_event(prediction, confidence, flow_summary, features, source=source,
+-                     model_version=engine.schema.get("model_version", "unversioned"))
++                     model_version=engine.schema.get("model_version", "unversioned"),
++                     observed_at=datetime.fromtimestamp(flow.last_seen, timezone.utc).isoformat(),
++                     alert_threshold=engine.alert_threshold)
+     except Exception:
+         STATS["flows_failed"] += 1
+         logger.exception("DATABASE WRITE FAILED for %s (db=%s)", flow_summary, config.ALERTS_DB_PATH)
+@@ -235,7 +221,9 @@
+ # ----------------------------------------------------------------------
+ # Main loop
+ # ----------------------------------------------------------------------
+-def run_monitor(iface_arg=None) -> None:
++def run_monitor(iface_arg=None, duration=None) -> None:
++    if duration is not None and not 1 <= duration <= 86400:
++        raise ValueError("Duration must be 1–86400 seconds.")
+     IP, TCP, UDP, AsyncSniffer, conf = _require_scapy()
+     ensure_directories(config.ALL_UNSW_OUTPUT_DIRS + [config.LOGS_DIR])
+     init_db()
+@@ -262,8 +250,10 @@
+     collector_failed = False
+ 
+     try:
+-        while True:
+-            time.sleep(config.MONITORING_INTERVAL_SECONDS)
++        deadline = time.monotonic() + duration if duration is not None else None
++        while deadline is None or time.monotonic() < deadline:
++            pause = config.MONITORING_INTERVAL_SECONDS if deadline is None else min(config.MONITORING_INTERVAL_SECONDS, max(0, deadline-time.monotonic()))
++            time.sleep(pause)
+ 
+             # AsyncSniffer swallows startup errors inside its thread. Check.
+             thread = getattr(sniffer, "thread", None)
+@@ -297,12 +287,12 @@
+         raise
+     finally:
+         if not collector_failed:
+-            heartbeat("stopped", "Collector stopped by operator.")
++            heartbeat("stopped", "Collector stopped.")
+         try:
+             sniffer.stop()
+         except Exception as e:  # stop() re-raises a stored startup error
+             logger.error("Sniffer reported: %s", e)
+-        for flow in tracker.pop_completed_flows():   # flush what's finished
++        for flow in tracker.pop_completed_flows(flush=True):   # include partially observed open flows on shutdown
+             process_completed_flow(flow, history, engine)
+         logger.info("Stopped. %d rows stored this run. Total in %s: %s",
+                     STATS["events_stored"], config.ALERTS_DB_PATH, get_summary_stats())
+@@ -310,6 +300,7 @@
+ 
+ if __name__ == "__main__":
+     ap = argparse.ArgumentParser(description="Real-time IDS monitor")
++    ap.add_argument("--duration",type=int,help="stop after this many seconds; flush remaining flows")
+     ap.add_argument("--iface", help="interface name (see --list-ifaces)")
+     ap.add_argument("--list-ifaces", action="store_true", help="show capturable interfaces and exit")
+     ap.add_argument("--selftest", action="store_true", help="push a synthetic flow into the DB and exit")
+@@ -320,4 +311,4 @@
+     elif args.selftest:
+         run_selftest()
+     else:
+-        run_monitor(args.iface)
++        run_monitor(args.iface,args.duration)
+--- /dev/null
++++ b/reference_study.py
+@@ -0,0 +1,76 @@
++"""Reference screenshot split direction. Report literal raw scores AND a deduplicated view."""
++import argparse
++from datetime import datetime,timezone
++import hashlib
++from pathlib import Path
++import time
++import numpy as np
++import pandas as pd
++from sklearn.model_selection import GroupShuffleSplit
++import config
++import benchmark as bm
++from src.gwo.feature_selector import GWOFeatureSelector
++from src.gwo.gwo_algorithm import grey_wolf_optimizer,binary_grey_wolf_optimizer
++from src.models.model_factory import get_model_factory
++from src.preprocessing.unsw_preprocessing import load_unsw_raw
++from evidence import write_pack
++
++
++def run(out):
++    started=time.perf_counter();out=Path(out);out.mkdir(parents=True,exist_ok=False)
++    # Match the visible sizes/roles, not the names printed on a downloaded CSV.
++    paths=[Path(config.UNSW_TEST_PATH),Path(config.UNSW_TRAIN_PATH)]
++    prot=dict(study="reference_direction_v1",train_file=paths[0].name,test_file=paths[1].name,iterations=20,
++        wolves=8,gwo_seeds=[42],search_trees=32,split_seed=42,final_rf={**config.RANDOM_FOREST_PARAMS,"n_jobs":2},
++        data_sha256={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in paths},
++        limitations=["Raw test is duplicate-weighted and may overlap training. Strict-view results supplied separately.",
++                     "Matches visible dataset direction and dimensions, not the friend's private algorithm or RF settings."])
++    bm.write_json(out/'protocol.json',prot)
++    tr,te=[load_unsw_raw(str(p)) for p in paths]
++    features=[n for n in tr if n not in ('id','label','attack_cat')]
++    if len(features)!=42 or len(tr)!=82332 or len(te)!=175341 or tr[features].isna().any().any() or te[features].isna().any().any():
++        raise ValueError("Expected the intact shipped presplit UNSW files.")
++    keys=bm.fingerprints(tr,features)
++    ia,ib=next(GroupShuffleSplit(n_splits=1,test_size=.2,random_state=42).split(tr,groups=keys))
++    fit=bm.bounded_sample(tr.iloc[ia],4800,42);val=bm.bounded_sample(tr.iloc[ib],1200,42)
++    test_keys=bm.fingerprints(te,features);overlaps=test_keys.isin(set(keys))
++    # Count each distinct input/label pair once in the sensitivity view.
++    first=~te.duplicated(features+['label']);strict=(~overlaps & first).to_numpy()
++    split=dict(raw_rows=dict(train=len(tr),test=len(te)),final_train_rows=len(tr),final_test_rows=len(te),
++        selection_fit_rows=len(fit),selection_validation_rows=len(val),raw_test_overlaps=int(overlaps.sum()),
++        strict_test_rows=int(strict.sum()),strict_policy="exclude training input hashes, then deduplicate inputs+label")
++    bm.write_json(out/'splits.json',split)
++    xf,xv=bm.transform_pair(fit,val,features);factory=get_model_factory('random_forest')
++    trace=[];masks={}
++    for pool,alg,budget in [('reference_auto',binary_grey_wolf_optimizer,None),
++                            ('reference_fixed20',grey_wolf_optimizer,20)]:
++        selector=GWOFeatureSelector(lambda:factory().set_params(n_jobs=2,n_estimators=32),xf,fit.label.to_numpy(),xv,val.label.to_numpy(),
++             list(range(42)),alpha=config.FITNESS_ALPHA,beta=config.FITNESS_BETA)
++        def step(i,fitness,score,n):trace.append(dict(pool=pool,seed=42,iteration=i,fitness=fitness,validation_accuracy_pct=score,features=n))
++        kw=dict(on_iteration=step)
++        if budget is not None:kw['feature_budget']=budget
++        win=alg(selector._evaluate_feature_mask,42,8,20,0,1,42,**kw)
++        masks[pool]=[f for f,b in zip(features,win.features) if b]
++        print(pool,len(masks[pool]),win.score,flush=True)
++    bm.write_json(out/'selection.json',masks);pd.DataFrame(trace).to_csv(out/'convergence.csv',index=False)
++    xt,xe=bm.transform_pair(tr,te,features);cache={};results=[]
++    for pool,subset in masks.items():
++        for method,names in [('baseline',features),('bGWO' if pool=='reference_auto' else 'ranked GWO',subset)]:
++            key=tuple(names)
++            if key not in cache:
++                idx=[features.index(f) for f in names];m=factory().set_params(**prot['final_rf'])
++                start=time.perf_counter();m.fit(xt[:,idx],tr.label.to_numpy());elapsed=time.perf_counter()-start
++                raw=bm.evaluate_model(m,xe[:,idx],te.label.to_numpy())
++                narrowed=bm.evaluate_model(m,xe[strict][:,idx],te.label.to_numpy()[strict])
++                cache[key]=dict(**raw,strict_test=narrowed,fit_seconds=elapsed)
++            results.append(dict(pool=pool,method=method,seed=None if method=='baseline' else 42,feature_count=len(names),
++                candidate_features=42,features=names,**cache[key]))
++            print(pool,method,results[-1]['accuracy_pct'],results[-1]['strict_test']['accuracy_pct'],flush=True)
++    bm.write_json(out/'results.json',dict(status='completed',protocol=prot,splits=split,results=results,duration_seconds=time.perf_counter()-started))
++    write_pack(out)
++
++
++if __name__=='__main__':
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--output',default='outputs/benchmarks/reference-'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ'))
++    run(p.parse_args().output)
+--- /dev/null
++++ b/scripts/Python312.ps1
+@@ -0,0 +1,10 @@
++function Get-ProjectPython {
++    foreach ($Relative in @('.venv312\Scripts\python.exe','.venv\Scripts\python.exe')) {
++        $Candidate = Join-Path (Get-Location).Path $Relative
++        if (Test-Path $Candidate) {
++            & $Candidate -c 'import sys; sys.exit(int(sys.version_info[:2] != (3, 12)))'
++            if ($LASTEXITCODE -eq 0) { return $Candidate }
++        }
++    }
++    throw 'Run scripts\Setup.ps1 to create a Python 3.12 environment. Existing environments are preserved.'
++}
+--- a/scripts/Replay.ps1
++++ b/scripts/Replay.ps1
+@@ -1,7 +1,7 @@
+ param([ValidateRange(1,1000)][int]$Limit=100)
+ $ErrorActionPreference = 'Stop'
+ Set-Location (Split-Path $PSScriptRoot -Parent)
+-$ProjectPython = Join-Path $PWD '.venv\Scripts\python.exe'
+-if (-not (Test-Path $ProjectPython)) { throw 'Run scripts\Setup.ps1 first.' }
++. "$PSScriptRoot\Python312.ps1"
++$ProjectPython = Get-ProjectPython
+ & $ProjectPython replay.py --limit $Limit
+ if ($LASTEXITCODE -ne 0) { throw 'Replay failed. Train a compatible model first and check database permissions.' }
+--- a/scripts/Setup.ps1
++++ b/scripts/Setup.ps1
+@@ -1,17 +1,31 @@
+-param([switch]$Train)
++param([switch]$Train, [string]$Python = '')
+ $ErrorActionPreference = 'Stop'
+ Set-Location (Split-Path $PSScriptRoot -Parent)
+-if (-not (Test-Path '.venv\Scripts\python.exe')) {
+-    & py -3.12 -m venv .venv
+-    if ($LASTEXITCODE -ne 0) { throw 'Python 3.12 environment creation failed. Install Python 3.12 x64 and its launcher.' }
++. "$PSScriptRoot\Python312.ps1"
++try { $ProjectPython = Get-ProjectPython } catch {
++    $Found = $false
++    $Install = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
++    foreach ($Candidate in @($Python, $Install, 'python', 'py')) {
++        if (-not $Candidate -or -not (Get-Command $Candidate -ErrorAction SilentlyContinue)) { continue }
++        $Arguments = @()
++        if ($Candidate -eq 'py') { $Arguments = @('-3.12') }
++        & $Candidate @Arguments -c 'import sys; sys.exit(int(sys.version_info[:2] != (3, 12)))'
++        if ($LASTEXITCODE -ne 0) { continue }
++        if (Test-Path '.venv312') { throw 'Existing .venv312 is unusable. Inspect it before creating a new environment.' }
++        & $Candidate @Arguments -m venv .venv312
++        if ($LASTEXITCODE -ne 0) { throw 'Python 3.12 environment creation failed.' }
++        $Found = $true
++        break
++    }
++    if (-not $Found) { throw 'Install Python 3.12 x64 or pass -Python with its full python.exe path.' }
++    $ProjectPython = Get-ProjectPython
+ }
+-$ProjectPython = Join-Path $PWD '.venv\Scripts\python.exe'
+ & $ProjectPython -m pip install -r requirements-dev.txt
+-if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed. Check Python version and network access.' }
++if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+ & $ProjectPython -m pip check
+ if ($LASTEXITCODE -ne 0) { throw 'Dependency consistency check failed.' }
+ if ($Train) {
+     & $ProjectPython train.py --quick
+-    if ($LASTEXITCODE -ne 0) { throw 'Training failed; inspect the error above.' }
++    if ($LASTEXITCODE -ne 0) { throw 'Training failed.' }
+ }
+-Write-Host 'Setup complete. Run scripts\Start.ps1 to open the local console.'
++Write-Host "Setup complete. Interpreter: $ProjectPython"
+--- a/scripts/Start.ps1
++++ b/scripts/Start.ps1
+@@ -1,6 +1,9 @@
++param([ValidateSet('deployment','compact20')][string]$ProfileName='deployment')
+ $ErrorActionPreference = 'Stop'
+ Set-Location (Split-Path $PSScriptRoot -Parent)
+-$ProjectPython = Join-Path $PWD '.venv\Scripts\python.exe'
+-if (-not (Test-Path $ProjectPython)) { throw 'Run scripts\Setup.ps1 first.' }
++. "$PSScriptRoot\Python312.ps1"
++$ProjectPython = Get-ProjectPython
++if ($env:IDS_MODEL_DIR) { Write-Host 'IDS_MODEL_DIR override is set; it takes precedence over ProfileName.' }
++$env:IDS_MODEL_PROFILE = $ProfileName
+ & $ProjectPython -m streamlit run dashboard/app.py --server.address 127.0.0.1
+ if ($LASTEXITCODE -ne 0) { throw 'Dashboard failed. Check the terminal error and whether port 8501 is in use.' }
+--- a/scripts/Test.ps1
++++ b/scripts/Test.ps1
+@@ -1,7 +1,7 @@
+ $ErrorActionPreference = 'Stop'
+ Set-Location (Split-Path $PSScriptRoot -Parent)
+-$ProjectPython = Join-Path $PWD '.venv\Scripts\python.exe'
+-if (-not (Test-Path $ProjectPython)) { throw 'Run scripts\Setup.ps1 first.' }
++. "$PSScriptRoot\Python312.ps1"
++$ProjectPython = Get-ProjectPython
+ & $ProjectPython -m compileall -q config.py main.py train.py realtime.py replay.py src dashboard tests
+ if ($LASTEXITCODE -ne 0) { throw 'Compilation failed.' }
+ & $ProjectPython -m pip check
+--- a/scripts/Train.ps1
++++ b/scripts/Train.ps1
+@@ -1,8 +1,8 @@
+ param([switch]$Quick, [ValidateSet('random_forest','decision_tree','knn','svm')][string]$Classifier='random_forest')
+ $ErrorActionPreference = 'Stop'
+ Set-Location (Split-Path $PSScriptRoot -Parent)
+-$ProjectPython = Join-Path $PWD '.venv\Scripts\python.exe'
+-if (-not (Test-Path $ProjectPython)) { throw 'Run scripts\Setup.ps1 first.' }
++. "$PSScriptRoot\Python312.ps1"
++$ProjectPython = Get-ProjectPython
+ $TrainArguments = @('train.py', '--classifier', $Classifier)
+ if ($Quick) { $TrainArguments += '--quick' }
+ & $ProjectPython @TrainArguments
+--- a/scripts/browser_smoke.cjs
++++ b/scripts/browser_smoke.cjs
+@@ -43,6 +43,28 @@
+  const health=await page.request.get((process.env.IDS_BROWSER_URL || 'http://127.0.0.1:8501')+'/_stcore/health');
+  if(!health.ok()||(await health.text()).trim()!=='ok')throw Error('Server unhealthy after populated sessions');
+  await second.close();
++ await page.getByText('Research results',{exact:true}).first().click();
++ await page.getByText('Baseline and selected subsets',{exact:true}).waitFor();
++ const downloadPromise=page.waitForEvent('download');
++ await page.getByText('Download all evidence',{exact:true}).click();
++ const archive=await downloadPromise;
++ if(!archive.suggestedFilename().endsWith('.zip'))throw Error('Missing report archive');
++ await page.getByText('Traffic lab',{exact:true}).first().click();
++ await page.getByRole('button',{name:'Measure local traffic'}).click();
++ await page.getByRole('button',{name:'Save measured flows'}).waitFor();
++ await page.getByRole('button',{name:'Save measured flows'}).click();
++ await page.getByText('Saved 4 observations.',{exact:true}).waitFor();
++ await page.getByText('Recorded PCAP',{exact:true}).click();
++ await page.getByText('Use the synthetic teaching capture',{exact:true}).click();
++ await page.getByRole('button',{name:'Analyze recorded capture'}).click();
++ await page.getByRole('button',{name:'Save measured flows'}).waitFor();
++ await page.getByRole('button',{name:'Save measured flows'}).click();
++ await page.getByText('Saved 2 observations.',{exact:true}).waitFor();
++ await page.getByText('Events & investigations',{exact:true}).click();
++ await page.getByRole('button',{name:'Explain this prediction'}).click();
++ await page.getByText(/Forest base attack score:/).waitFor();
++ if(await page.locator('[data-testid="stException"]').count())throw Error('Research/traffic UI exception');
++
+  await page.setViewportSize({width:390,height:844});
+  await page.waitForTimeout(700);
+  const collapse=page.getByTestId('stSidebarCollapseButton').getByRole('button');
+@@ -52,7 +74,7 @@
+  await page.emulateMedia({reducedMotion:'reduce'});
+  await page.screenshot({path:(process.env.IDS_BROWSER_OUTPUT || '/tmp')+'/ids-mobile.png',fullPage:true});
+  const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth);
+- console.log(JSON.stringify({pages:5,analysisRows:50,persistedRows:50,simultaneousSessions:2,fragmentRefresh:true,healthStatus:health.status(),pageErrors:errors,mobilePageOverflow:overflow}));
++ console.log(JSON.stringify({pages:7,analysisRows:50,persistedRows:56,loopbackFlows:4,pcapFlows:2,evidenceDownload:true,explanation:true,simultaneousSessions:2,fragmentRefresh:true,healthStatus:health.status(),pageErrors:errors,mobilePageOverflow:overflow}));
+  await browser.close();
+  if(errors.length||overflow)process.exit(1);
+ })().catch(e=>{console.error(e);process.exit(1)});
+--- /dev/null
++++ b/scripts/example_capture.py
+@@ -0,0 +1,39 @@
++"""Generate a classic PCAP fixture offline. No sockets or packet capture required."""
++from pathlib import Path
++import socket
++import struct
++
++
++def checksum(data):
++    if len(data)%2:data+=bytes(1)
++    n=sum(struct.unpack("!%dH"%(len(data)//2),data))
++    while n>>16:n=(n&65535)+(n>>16)
++    return (~n)&65535
++
++
++def frame(source,destination,proto,sport,dport,payload=b"",flags=0):
++    src,dst=map(socket.inet_aton,(source,destination))
++    if proto==17:transport=struct.pack("!HHHH",sport,dport,8+len(payload),0)+payload
++    else:transport=struct.pack("!HHIIBBHHH",sport,dport,1,1,0x50,flags,4096,0,0)+payload
++    c=checksum(src+dst+struct.pack("!BBH",0,proto,len(transport))+transport)
++    off=6 if proto==17 else 16
++    transport=transport[:off]+struct.pack("!H",c or 65535)+transport[off+2:]
++    ip=struct.pack("!BBHHHBBH4s4s",0x45,0,20+len(transport),1,0,64,proto,0,src,dst)
++    ip=ip[:10]+struct.pack("!H",checksum(ip))+ip[12:]
++    return bytes.fromhex("0200000000020200000000010800")+ip+transport
++
++
++def make_capture():
++    a,b="192.0.2.10","198.51.100.20"
++    packets=[frame(a,b,17,50001,53,b"fixture query"),frame(b,a,17,53,50001,b"fixture reply"),
++             frame(a,b,6,50002,443,flags=2),frame(b,a,6,443,50002,flags=18),
++             frame(a,b,6,50002,443,flags=16),frame(a,b,6,50002,443,flags=17)]
++    # One explicit non-IPv4 frame exercises the skipped-frame counter.
++    packets.append(bytes.fromhex("0200000000020200000000010806")+bytes(28))
++    out=struct.pack("<IHHIIII",0xa1b2c3d4,2,4,0,0,65535,1)
++    for i,p in enumerate(packets):out+=struct.pack("<IIII",1700000000,i*50000,len(p),len(p))+p
++    return out
++
++
++if __name__=="__main__":
++    (Path(__file__).resolve().parents[1]/"examples"/"teaching_capture.pcap").write_bytes(make_capture())
+--- a/src/gwo/gwo_algorithm.py
++++ b/src/gwo/gwo_algorithm.py
+@@ -68,6 +68,7 @@
+     lb: float,
+     ub: float,
+     seed: int = 42,
++    *, feature_budget=None, on_iteration=None,
+ ) -> Wolf:
+     """
+     Standard (sigmoid-decoded) Grey Wolf Optimization for feature
+@@ -99,12 +100,19 @@
+ 
+     if dim < 1 or n_wolves < 3 or max_iter < 0 or lb >= ub:
+         raise ValueError("Require dim >= 1, wolves >= 3, iterations >= 0 and lower < upper.")
++    if feature_budget is not None and not 1 <= feature_budget <= dim:
++        raise ValueError("Feature budget must be in 1..dim.")
++    def budget_mask(position):
++        chosen = set(sorted(range(dim), key=lambda j: (-position[j], j))[:feature_budget])
++        return [int(j in chosen) for j in range(dim)]
+     rand = random.Random(seed)
+     population = [Wolf(fitness_score, dim, seed=seed + i, lb=lb, ub=ub) for i in range(n_wolves)]
+     # Every score must correspond to the actual mask. Include an all-feature
+     # reference and diverse starting subsets; never reuse another mask's score.
+     for index, wolf in enumerate(population):
+-        if index:
++        if feature_budget is not None:
++            wolf.features = budget_mask(wolf.position)
++        elif index:
+             wolf.features = [int(x >= (lb + ub) / 2) for x in wolf.position]
+             if not any(wolf.features):
+                 wolf.features[index % dim] = 1
+@@ -136,6 +144,8 @@
+ 
+                 x_decoded[j] = sigmoid_transfer(x_new[j])
+ 
++            if feature_budget is not None:
++                x_decoded = budget_mask(x_new)
+             fitness_val, score_val = evaluate_fn(x_decoded)
+ 
+             if fitness_val > population[i].fitness:
+@@ -148,6 +158,8 @@
+             A1, A2, A3, C1, C2, C3 = _coefficients(b, rand)
+ 
+         alpha_wolf, beta_wolf, delta_wolf = _initialize_leaders(population)
++        if on_iteration is not None:
++            on_iteration(iteration, alpha_wolf.fitness, alpha_wolf.score, sum(alpha_wolf.features))
+         logger.info(
+             "Iteration %d/%d | best fitness=%.4f score=%.4f n_features=%d",
+             iteration, max_iter, alpha_wolf.fitness, alpha_wolf.score, sum(alpha_wolf.features),
+@@ -164,6 +176,7 @@
+     lb: float,
+     ub: float,
+     seed: int = 42,
++    *, on_iteration=None,
+ ) -> Wolf:
+     """
+     Binary Grey Wolf Optimization (bGWO) for feature selection. Each
+@@ -232,6 +245,8 @@
+             A1, A2, A3, C1, C2, C3 = _coefficients(b, rand)
+ 
+         alpha_wolf, beta_wolf, delta_wolf = _initialize_leaders(population)
++        if on_iteration is not None:
++            on_iteration(iteration, alpha_wolf.fitness, alpha_wolf.score, sum(alpha_wolf.features))
+         logger.info(
+             "Iteration %d/%d | best fitness=%.4f score=%.4f n_features=%d",
+             iteration, max_iter, alpha_wolf.fitness, alpha_wolf.score, sum(alpha_wolf.features),
+--- a/src/runtime/alerting.py
++++ b/src/runtime/alerting.py
+@@ -42,6 +42,9 @@
+ """
+ 
+ 
++EVENT_SOURCES = ("live", "loopback_probe", "pcap_replay", "dataset_replay", "csv_import", "selftest", "legacy")
++
++
+ def init_db(db_path: str = None) -> None:
+     """Create the SQLite database and schema if they don't already exist."""
+     db_path = db_path or config.ALERTS_DB_PATH
+@@ -50,12 +53,17 @@
+     with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
+         conn.execute("PRAGMA journal_mode=WAL")
+         conn.executescript(_SCHEMA)
++        conn.execute("BEGIN IMMEDIATE")  # Serialize discovery and additive ALTERs across sessions.
+         # Additive migration: original event rows remain intact.
+         columns = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+         if "source" not in columns:
+             conn.execute("ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
+         if "model_version" not in columns:
+             conn.execute("ALTER TABLE events ADD COLUMN model_version TEXT")
++        if "observed_at" not in columns:
++            conn.execute("ALTER TABLE events ADD COLUMN observed_at TEXT")
++        if "batch_id" not in columns:
++            conn.execute("ALTER TABLE events ADD COLUMN batch_id TEXT")
+         conn.executescript("""
+         CREATE TABLE IF NOT EXISTS incident_reviews (
+             event_id INTEGER PRIMARY KEY REFERENCES events(id),
+@@ -95,6 +103,8 @@
+     db_path: str = None,
+     source: str = "live",
+     model_version: str = None,
++    observed_at: str = None,
++    alert_threshold: float = None,
+ ) -> bool:
+     """
+     Store one prediction event. If it's an attack prediction with
+@@ -124,18 +134,20 @@
+ 
+     if prediction not in (0, 1) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+         raise ValueError("Prediction must be binary and confidence finite in [0, 1].")
+-    if source not in {"live", "selftest", "dataset_replay", "csv_import"}:
++    if source not in EVENT_SOURCES[:-1]:
+         raise ValueError("Invalid source.")
+     prediction_label = "attack" if prediction == 1 else "normal"
+-    is_alert = int(prediction == 1 and confidence >= config.ALERT_CONFIDENCE_THRESHOLD)
++    cutoff = config.ALERT_CONFIDENCE_THRESHOLD if alert_threshold is None else alert_threshold
++    if not math.isfinite(cutoff) or not .5 <= cutoff <= 1:raise ValueError("Invalid alert threshold.")
++    is_alert = int(prediction == 1 and confidence >= cutoff)
+ 
+     with _connection(db_path) as conn:
+         conn.execute(
+             """
+             INSERT INTO events
+                 (timestamp, prediction, confidence, src_ip, dst_ip, src_port,
+-                 dst_port, proto, service, is_alert, features_json, source, model_version)
+-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                 dst_port, proto, service, is_alert, features_json, source, model_version, observed_at)
++            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             """,
+             (
+                 datetime.now(timezone.utc).isoformat(),
+@@ -149,7 +161,7 @@
+                 flow_summary.get("service"),
+                 is_alert,
+                 _json.dumps(features, default=str, allow_nan=False),
+-                source, model_version,
++                source, model_version, observed_at,
+             ),
+         )
+ 
+@@ -202,7 +214,7 @@
+         raise ValueError("Invalid pagination.")
+     if prediction not in {"all", "normal", "attack"}:
+         raise ValueError("Invalid prediction filter.")
+-    if source not in {"all", "live", "selftest", "dataset_replay", "csv_import", "legacy"}:
++    if source not in {"all", *EVENT_SOURCES}:
+         raise ValueError("Invalid event source.")
+     if review_state not in {"all", *REVIEW_TRANSITIONS}:
+         raise ValueError("Invalid review state.")
+@@ -273,3 +285,25 @@
+         conn.row_factory = sqlite3.Row
+         row = conn.execute("SELECT * FROM collector_health WHERE id=1").fetchone()
+         return dict(row) if row else None
++
++
++def source_totals(db_path=None):
++    """All stored rows grouped by input source, including historical records."""
++    with _connection(db_path) as conn:
++        return dict(conn.execute("SELECT source, COUNT(*) FROM events GROUP BY source"))
++
++
++def hourly_counts(rows):
++    """UTC buckets on ISO timestamp strings, allowing historical naive UTC records."""
++    buckets = {}; invalid = 0
++    for row in rows:
++        try:
++            stamp = datetime.fromisoformat(row["timestamp"])
++            stamp = (stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
++            hour = stamp.strftime("%Y-%m-%d %H:00Z")
++        except (ValueError, TypeError, OverflowError):
++            invalid += 1
++            continue
++        counts = buckets.setdefault(hour, {})
++        label = row["prediction"]; counts[label] = counts.get(label, 0) + 1
++    return buckets, invalid
+--- a/src/runtime/batch.py
++++ b/src/runtime/batch.py
+@@ -42,20 +42,22 @@
+     if not np.isfinite(numeric.to_numpy()).all() or (numeric < 0).any().any():
+         raise ValueError("Numeric features must be finite and nonnegative.")
+     features[engine.numeric_features] = numeric
+-    results = []
+-    for index, row in enumerate(features.to_dict("records"), 1):
+-        label, confidence = engine.predict(row)
+-        results.append({"row": index, "prediction": "attack" if label else "normal",
+-                        "confidence": confidence,
+-                        "alert": bool(label == 1 and confidence >= config.ALERT_CONFIDENCE_THRESHOLD)})
+-    return pd.DataFrame(results), features.to_dict("records")
++    labels, confidence = engine.predict_many(features)
++    results = pd.DataFrame({"row": np.arange(1,len(features)+1),
++        "prediction": np.where(labels==1,"attack","normal"), "confidence":confidence,
++        "alert": (labels==1) & (confidence>=engine.alert_threshold)})
++    return results, features.to_dict("records")
+ 
+ 
+-def store_batch(results, features, batch_id, source="csv_import", model_version=None, db_path=None):
++def store_batch(results, features, batch_id, source="csv_import", model_version=None, db_path=None, *, metadata=None):
+     """All-or-nothing, idempotent replay/import. Same batch token cannot duplicate events."""
+     uuid.UUID(batch_id)
+-    if source not in {"csv_import", "dataset_replay"} or len(results) != len(features) or not len(results):
++    if source not in {"csv_import", "dataset_replay", "pcap_replay", "loopback_probe"} or len(results) != len(features) or not len(results):
+         raise ValueError("Invalid batch.")
++    if metadata is None:
++        metadata = [{} for _ in features]
++    if len(metadata) != len(features):
++        raise ValueError("Flow metadata count does not match predictions.")
+     with _connection(db_path) as conn:
+         conn.execute("BEGIN IMMEDIATE")
+         if conn.execute("SELECT 1 FROM import_batches WHERE id=?", (batch_id,)).fetchone():
+@@ -63,10 +65,11 @@
+         now = datetime.now(timezone.utc).isoformat()
+         conn.execute("INSERT INTO import_batches(id,source,created_at,row_count) VALUES(?,?,?,?)",
+                      (batch_id, source, now, len(results)))
+-        for result, feature in zip(results.to_dict("records"), features):
++        for result, feature, meta in zip(results.to_dict("records"), features, metadata):
+             conn.execute("""INSERT INTO events(timestamp,prediction,confidence,proto,service,
+-                is_alert,features_json,source,model_version) VALUES(?,?,?,?,?,?,?,?,?)""",
++                is_alert,features_json,source,model_version,batch_id,observed_at,src_ip,src_port,dst_ip,dst_port) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 (now, result["prediction"], float(result["confidence"]), str(feature["proto"]),
+                  str(feature["service"]), int(result["alert"]), json.dumps(feature, allow_nan=False),
+-                 source, model_version))
++                 source, model_version, batch_id, meta.get("observed_at"), meta.get("src_ip"),
++                 meta.get("src_port"), meta.get("dst_ip"), meta.get("dst_port")))
+     return len(results)
+--- /dev/null
++++ b/src/runtime/explain.py
+@@ -0,0 +1,32 @@
++"""Local, additive tree-path contributions for a saved binary RF prediction."""
++import numpy as np
++from sklearn.ensemble import RandomForestClassifier
++
++
++def explain_observation(engine, event):
++    if event.get("model_version") != engine.schema.get("model_version"):
++        raise ValueError("The active model differs from the model that recorded this event.")
++    if not isinstance(engine.model,RandomForestClassifier):
++        raise ValueError("Decision-path explanations are available for Random Forest models.")
++    import json
++    raw=json.loads(event["features_json"]);x=engine._apply_preprocessing(raw)[:,engine.selected_idx].astype(np.float32)
++    model=engine.model;pos=list(model.classes_).index(1)
++    deltas=np.zeros(len(engine.selected_idx));base=0.
++    for tree in model.estimators_:
++        t=tree.tree_
++        def attack(node):
++            v=t.value[node,0];return float(v[pos]/v.sum())
++        node=0;base+=attack(0)
++        while t.children_left[node]!=t.children_right[node]:
++            feat=t.feature[node]
++            next_node=t.children_left[node] if x[0,feat]<=t.threshold[node] else t.children_right[node]
++            deltas[feat]+=attack(next_node)-attack(node);node=next_node
++    base/=len(model.estimators_);deltas/=len(model.estimators_)
++    actual=float(model.predict_proba(x)[0,pos])
++    if not np.isclose(base+deltas.sum(),actual,atol=1e-8):
++        raise ValueError("Decision-path reconstruction did not match the forest.")
++    stored=float(event["confidence"]) if event['prediction']=='attack' else 1-float(event['confidence'])
++    if not np.isclose(actual,stored,atol=1e-7):raise ValueError("The recorded score could not be reproduced.")
++    terms=[{"Feature":name,"Observed value":str(raw[name]),"Change in attack score (points)":float(100*delta)}
++           for name,delta in zip(engine.selected_features,deltas) if abs(delta)>1e-12]
++    return {"base":base,"score":actual,"contributions":sorted(terms,key=lambda v:-abs(v["Change in attack score (points)"]))}
+--- a/src/runtime/flow_tracker.py
++++ b/src/runtime/flow_tracker.py
+@@ -164,14 +164,14 @@
+                 tcp_flags=tcp_flags, tcp_seq=tcp_seq, tcp_window=tcp_window,
+             ))
+ 
+-    def pop_completed_flows(self) -> List[Flow]:
++    def pop_completed_flows(self, now=None, *, flush=False) -> List[Flow]:
+         """
+         Remove and return every flow that is either explicitly closed
+         (FIN/RST seen) or idle past the timeout, leaving all other
+         still-active flows in place for future packets.
+         """
+         with self._lock:
+-            now = time.time()
++            now = time.time() if now is None else now
+             completed = []
+             for key in list(self._flows.keys()):
+                 flow = self._flows[key]
+@@ -180,7 +180,7 @@
+                     self.max_flow_age_seconds is not None
+                     and (now - flow.first_seen) > self.max_flow_age_seconds
+                 )
+-                if flow.is_closed_by_flags or is_idle or is_too_old:
++                if flush or flow.is_closed_by_flags or is_idle or is_too_old:
+                     completed.append(flow)
+                     del self._flows[key]
+             return completed
+--- a/src/runtime/inference.py
++++ b/src/runtime/inference.py
+@@ -61,6 +61,9 @@
+ 
+         if self.schema.get("classification_mode") != "binary":
+             raise ValueError("Live monitoring requires a binary deployment model. Multiclass remains offline-only.")
++        self.alert_threshold = float(self.schema.get("alert_threshold", config.ALERT_CONFIDENCE_THRESHOLD))
++        if not np.isfinite(self.alert_threshold) or not .5 <= self.alert_threshold <= 1:
++            raise ValueError("Invalid model alert threshold.")
+         self.feature_order = self.schema["runtime_feasible_features_in_order"]
+         self.categorical_features = self.schema["categorical_features"]
+         self.numeric_features = self.schema["numeric_features"]
+@@ -72,64 +75,39 @@
+             len(self.feature_order), len(self.selected_features),
+         )
+ 
++    def _prepare_frame(self, frame):
++        import pandas as pd
++        missing = set(self.feature_order) - set(frame.columns)
++        if missing: raise ValueError(f"Feature vector is missing required features: {missing}")
++        data = frame[self.feature_order].copy()
++        if data.empty or data.isna().any().any():raise ValueError("Feature values cannot be empty.")
++        for col in self.categorical_features:
++            encoder=self.categorical_encoders[col]
++            values=data[col].astype(str)
++            if col=="proto":values=values.mask(values.isin(self.rare_proto_values),"other")
++            unknown=~values.isin(encoder.classes_)
++            if unknown.any() and "__unknown__" not in encoder.classes_:raise ValueError("Unknown category: retrain the model.")
++            data[col]=encoder.transform(values.mask(unknown,"__unknown__"))
++        numeric=data[self.numeric_features].apply(pd.to_numeric,errors="raise")
++        if not np.isfinite(numeric.to_numpy()).all() or (numeric<0).any().any():
++            raise ValueError("All numeric features must be finite and nonnegative.")
++        matrix=data.to_numpy(dtype=float)
++        matrix[:,[self.feature_order.index(k) for k in self.numeric_features]]=self.scaler.transform(numeric)
++        return matrix
++
+     def _apply_preprocessing(self, raw_features: Dict) -> np.ndarray:
+-        """
+-        Apply, in order: rare-protocol bucketing -> categorical encoding
+-        (via saved encoders, never refit) -> numeric scaling (via saved
+-        scaler, never refit) -> feature-order alignment.
+-        """
+-        row = dict(raw_features)  # shallow copy, don't mutate caller's dict
++        import pandas as pd
++        return self._prepare_frame(pd.DataFrame([raw_features]))
+ 
+-        # Validate schema BEFORE transforming -- fail loudly rather than
+-        # silently predicting on a malformed/incomplete feature vector.
+-        missing = set(self.feature_order) - set(row.keys())
+-        if missing:
+-            raise ValueError(f"Feature vector is missing required features: {missing}")
+-
+-        if "proto" in row and row["proto"] in self.rare_proto_values:
+-            row["proto"] = "other"
+-
+-        for col in self.categorical_features:
+-            encoder = self.categorical_encoders[col]
+-            value = str(row[col])
+-            if value not in set(encoder.classes_):
+-                if "__unknown__" not in encoder.classes_:
+-                    raise ValueError("Legacy encoder lacks an unknown category. Retrain the model.")
+-                value = "__unknown__"
+-            row[col] = encoder.transform([value])[0]
+-
+-        ordered_values = np.array([[row[f] for f in self.feature_order]], dtype=float)
+-
+-        if not np.isfinite(ordered_values).all() or (ordered_values < 0).any():
+-            raise ValueError("All numeric features must be finite and nonnegative.")
+-        import pandas as pd
+-        numeric_idx = [self.feature_order.index(f) for f in self.numeric_features]
+-        numeric_df = pd.DataFrame(ordered_values[:, numeric_idx], columns=self.numeric_features)
+-        ordered_values[:, numeric_idx] = self.scaler.transform(numeric_df)
+-
+-        return ordered_values
++    def predict_many(self, frame):
++        matrix=self._prepare_frame(frame)[:,self.selected_idx]
++        labels=self.model.predict(matrix).astype(int)
++        scores=self.model.predict_proba(matrix)
++        mapping={int(v):i for i,v in enumerate(self.model.classes_)}
++        confidence=scores[np.arange(len(labels)),[mapping[int(v)] for v in labels]]
++        return labels,confidence
+ 
+     def predict(self, raw_features: Dict) -> Tuple[int, float]:
+-        """
+-        Run the full preprocessing + GWO-feature-mask + prediction chain
+-        on one flow's raw feature dictionary.
+-
+-        Returns
+-        -------
+-        Tuple[int, float]
+-            (predicted_label, confidence) where predicted_label is 0
+-            (normal) or 1 (attack) and confidence is the model's
+-            probability for the predicted class (0.5 if the underlying
+-            model has no predict_proba).
+-        """
+-        full_vector = self._apply_preprocessing(raw_features)
+-        selected_vector = full_vector[:, self.selected_idx]
+-
+-        prediction = int(self.model.predict(selected_vector)[0])
+-
+-        confidence = 0.5
+-        if hasattr(self.model, "predict_proba"):
+-            proba = self.model.predict_proba(selected_vector)[0]
+-            confidence = float(proba[list(self.model.classes_).index(prediction)])
+-
+-        return prediction, confidence
++        import pandas as pd
++        labels,scores=self.predict_many(pd.DataFrame([raw_features]))
++        return int(labels[0]),float(scores[0])
+--- /dev/null
++++ b/src/runtime/packet_headers.py
+@@ -0,0 +1,40 @@
++"""Read only IPv4/transport metadata. Never retain payloads or reassemble fragments."""
++import socket
++import struct
++
++
++def decode_ipv4(ip, wire_length, ts):
++    if not ip or ip[0] >> 4 != 4:return None,"non_ipv4"
++    if len(ip)<20:return None,"truncated"
++    ihl=(ip[0]&15)*4
++    total,frag=struct.unpack_from("!H",ip,2)[0],struct.unpack_from("!H",ip,6)[0]
++    if not 20<=ihl<=total:return None,"malformed"
++    if total>len(ip):return None,"truncated"
++    if frag&0x3fff:return None,"fragment"
++    payload=ip[ihl:total];proto=ip[9]
++    if proto not in (6,17):return None,"unsupported_transport"
++    if len(payload)<(20 if proto==6 else 8):return None,"truncated"
++    sport,dport=struct.unpack_from("!HH",payload)
++    flags=seq=window=None
++    if proto==6:
++        hdr=(payload[12]>>4)*4
++        if not 20<=hdr<=len(payload):return None,"malformed"
++        flags="".join(c for bit,c in enumerate("FSRPAUEC") if payload[13]&(1<<bit))
++        seq=struct.unpack_from("!I",payload,4)[0];window=struct.unpack_from("!H",payload,14)[0]
++    elif not 8<=struct.unpack_from("!H",payload,4)[0]<=len(payload):return None,"malformed"
++    return dict(proto="tcp" if proto==6 else "udp",src_ip=socket.inet_ntoa(ip[12:16]),src_port=sport,
++        dst_ip=socket.inet_ntoa(ip[16:20]),dst_port=dport,length=wire_length,ttl=ip[8],timestamp=ts,
++        tcp_flags=flags,tcp_seq=seq,tcp_window=window),None
++
++
++def decode_frame(data, linktype, ts):
++    if linktype==101:return decode_ipv4(data,len(data),ts)
++    if linktype!=1:return None,"unsupported_link"
++    if len(data)<14:return None,"truncated"
++    off=14;etype=int.from_bytes(data[12:14],"big")
++    for _ in range(2):
++        if etype not in (0x8100,0x88a8):break
++        if off+4>len(data):return None,"truncated"
++        etype=int.from_bytes(data[off+2:off+4],"big");off+=4
++    if etype!=0x800:return None,"non_ipv4"
++    return decode_ipv4(data[off:],len(data),ts)
+--- /dev/null
++++ b/src/runtime/traffic_lab.py
+@@ -0,0 +1,101 @@
++"""Measured local UDP exchanges and bounded classic-PCAP analysis. No payload is persisted."""
++import hashlib
++import socket
++import struct
++import time
++import uuid
++from datetime import datetime, timezone
++
++import pandas as pd
++import config
++from src.runtime.batch import MAX_BYTES, MAX_ROWS, analyze_frame, store_batch
++from src.runtime.feature_extraction import extract_features, FlowHistory
++from src.runtime.flow_tracker import FlowTracker
++
++
++def tracker():
++    return FlowTracker(config.FLOW_IDLE_TIMEOUT_SECONDS, getattr(config,"FLOW_MAX_AGE_SECONDS",30))
++
++
++def packet_fields(packet):
++    from scapy.layers.inet import IP
++    from src.runtime.packet_headers import decode_ipv4
++    if IP not in packet:return None,"non_ipv4"
++    return decode_ipv4(bytes(packet[IP]),len(packet),float(packet.time))
++
++
++def predict_flows(flows, engine, source, token, stats):
++    if not flows: raise ValueError("No complete supported IPv4 TCP/UDP flows to analyze.")
++    history=FlowHistory(config.FLOW_HISTORY_WINDOW); features=[]; meta=[]
++    for flow in flows:
++        values=extract_features(flow,history);features.append(values)
++        history.record({**flow.flow_key_summary(),"state":values["state"]})
++        meta.append({**flow.flow_key_summary(),"observed_at":datetime.fromtimestamp(flow.last_seen,timezone.utc).isoformat()})
++    results, features=analyze_frame(pd.DataFrame(features),engine)
++    return dict(results=results,features=features,metadata=meta,batch_id=token,source=source,
++                version=engine.schema["model_version"],stats=stats)
++
++
++def persist(batch, db_path=None):
++    return store_batch(batch["results"],batch["features"],batch["batch_id"],batch["source"],
++                       batch["version"],db_path,metadata=batch["metadata"])
++
++
++def analyze_pcap(data,engine):
++    from src.runtime.packet_headers import decode_frame
++    formats={b"\xd4\xc3\xb2\xa1":("<",1e6),b"\xa1\xb2\xc3\xd4":(">",1e6),
++             b"\x4d\x3c\xb2\xa1":("<",1e9),b"\xa1\xb2\x3c\x4d":(">",1e9)}
++    if not 24 <= len(data) <= MAX_BYTES or data[:4] not in formats:
++        raise ValueError("Provide classic PCAP, uncompressed, up to 10 MiB (not PCAPNG).")
++    endian, unit=formats[data[:4]]
++    major,minor,_,_,snap,kind=struct.unpack_from(endian+"HHiIII",data,4)
++    if (major,minor)!=(2,4) or kind not in {1,101} or not 1<=snap<=262144:
++        raise ValueError("Expected PCAP 2.4 with Ethernet or raw IP.")
++    flow_tracker=tracker(); flows=[]; offset=24; previous=-1.; packets=0; skipped={};accepted=0
++    while offset<len(data):
++        packets+=1
++        if packets>20000 or offset+16>len(data):raise ValueError("Too many packets or incomplete PCAP record.")
++        sec,fraction,captured,original=struct.unpack_from(endian+"IIII",data,offset);offset+=16
++        if fraction>=unit or not 0<captured<=min(original,snap,len(data)-offset):raise ValueError("Invalid PCAP record length/time.")
++        ts=sec+fraction/unit
++        if ts<previous:raise ValueError("PCAP timestamps must be chronological.")
++        previous=ts
++        payload=data[offset:offset+captured];offset+=captured
++        flows.extend(flow_tracker.pop_completed_flows(now=ts))
++        if len(flows)+flow_tracker.active_flow_count()>MAX_ROWS:raise ValueError("Maximum 1,000 flows per import.")
++        if captured!=original:reason="truncated";fields=None
++        else:fields,reason=decode_frame(payload,kind,ts)
++        if fields is None:
++            skipped[reason]=skipped.get(reason,0)+1;continue
++        flow_tracker.on_packet(**fields);accepted+=1
++    flows.extend(flow_tracker.pop_completed_flows(now=previous,flush=True))
++    if len(flows)>MAX_ROWS or flow_tracker.dropped_packets:raise ValueError("Flow capacity exceeded; use a smaller capture.")
++    # Same file analyzed with the same trained bundle cannot be imported twice.
++    key=hashlib.sha256(data).hexdigest()
++    token=str(uuid.uuid5(uuid.NAMESPACE_URL, "ids-pcap-v1:"+key+":"+engine.schema["model_version"]))
++    return predict_flows(flows,engine,"pcap_replay",token,dict(packets=packets,accepted_packets=accepted,
++                         skipped=skipped,flows=len(flows),file_sha256=key))
++
++
++def loopback_probe(engine, count=4):
++    """Only sends to ephemeral localhost sockets. Instrumented test traffic, never adapter capture."""
++    if not 1 <= count <= 25: raise ValueError("Choose 1–25 exchanges.")
++    flows=[]
++    for i in range(count):
++        t=tracker()
++        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as client,socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as server:
++            for s in (client,server):
++                s.bind(("127.0.0.1",0));s.settimeout(2.)
++            for sender,receiver,size in [(client,server,40+i),(server,client,32+i)]:
++                payload=bytes(size)
++                sender.sendto(payload,receiver.getsockname())
++                actual,origin=receiver.recvfrom(2048)
++                if actual!=payload or origin!=sender.getsockname():raise OSError("Unexpected local datagram.")
++                # Socket-observed receive time, sender TTL and IPv4+UDP byte estimate;
++                # no link-layer measurement or payload-based inference.
++                dest=receiver.getsockname()
++                t.on_packet("udp",origin[0],origin[1],dest[0],dest[1],len(actual)+28,
++                            sender.getsockopt(socket.IPPROTO_IP,socket.IP_TTL),time.time())
++        flows.extend(t.pop_completed_flows(flush=True))
++    return predict_flows(flows,engine,"loopback_probe",str(uuid.uuid4()),dict(flows=count,
++        datagrams_received=2*count,network="IPv4 UDP localhost; socket instrumented",attack_labels=False))
+--- /dev/null
++++ b/tests/test_major_lab.py
+@@ -0,0 +1,200 @@
++import json
++from pathlib import Path
++import struct
++import uuid
++import zipfile
++
++import numpy as np
++import pandas as pd
++import pytest
++from streamlit.testing.v1 import AppTest
++
++import config
++from budget_study import threshold_for_fpr, policy_metrics, calibration_partition
++from evidence import comparison, convergence, read_run
++from src.gwo.gwo_algorithm import grey_wolf_optimizer
++from src.runtime.alerting import query_events, hourly_counts, source_totals
++from src.runtime.explain import explain_observation
++from src.runtime.packet_headers import decode_frame
++from src.runtime.traffic_lab import analyze_pcap, persist, loopback_probe
++from scripts.example_capture import make_capture, frame
++
++ROOT=Path(__file__).resolve().parents[1]
++
++
++def test_exact_budget_is_enforced_for_every_scored_mask():
++    seen=[];trace=[]
++    def score(mask):
++        seen.append(mask.copy());s=sum(i*x for i,x in enumerate(mask));return s,s
++    wolf=grey_wolf_optimizer(score,12,5,5,0,1,42,feature_budget=4,on_iteration=lambda *row:trace.append(row))
++    assert all(sum(m)==4 for m in seen)
++    assert sum(wolf.features)==4 and len(trace)==5
++    assert [r[1] for r in trace]==sorted(r[1] for r in trace)
++    with pytest.raises(ValueError):grey_wolf_optimizer(score,12,5,5,0,1,42,feature_budget=13)
++
++
++def test_calibration_disjoint_and_threshold_uses_benign_ties():
++    import benchmark as bm
++    train=pd.read_csv(config.UNSW_TRAIN_PATH,nrows=600);a,b=train.iloc[:50],train.iloc[50:70]
++    train,cal=calibration_partition(train,a,b,42)
++    keys=lambda d:set(bm.fingerprints(d,config.RUNTIME_FEASIBLE_FEATURES))
++    assert not keys(cal)&(keys(train)|keys(a)|keys(b))
++    labels=np.array([0]*10+[1]*4);scores=np.array([.5]*8+[.9]*2+[.9,1.,1.,1.])
++    cut=threshold_for_fpr(labels,scores,.05);actual=policy_metrics(labels,scores,cut)
++    assert actual['fpr_pct']==0 and actual['attack_recall_pct']==75
++    assert threshold_for_fpr(labels,np.ones(14),.05)>1
++
++
++def test_pcap_observations_follow_capture_clock_and_are_idempotent(engine,db):
++    data=make_capture();b=analyze_pcap(data,engine)
++    assert (b['stats']['packets'],b['stats']['accepted_packets'],b['stats']['flows'])==(7,6,2)
++    assert b['stats']['skipped']=={'non_ipv4':1}
++    assert persist(b,db)==2 and persist(analyze_pcap(data,engine),db)==0
++    rows,n=query_events(db_path=db,source='pcap_replay')
++    assert n==2 and all(r['observed_at'].startswith('2023-11-14') and r['batch_id']==b['batch_id'] for r in rows)
++    assert all(set(json.loads(r['features_json']))==set(config.RUNTIME_FEASIBLE_FEATURES) for r in rows)
++    assert source_totals(db)=={'pcap_replay':2}
++
++
++@pytest.mark.parametrize("kind",['bad_magic','truncated','backward_time','unsupported_link'])
++def test_corrupt_pcap_is_rejected_without_writes(engine,db,kind):
++    b=bytearray(make_capture())
++    if kind=='bad_magic': b[:4]=b'bad!'
++    elif kind=='truncated':del b[-1:]
++    elif kind=='backward_time':
++        second=24+16+struct.unpack_from('<I',b,32)[0];struct.pack_into('<I',b,second,123)
++    else:struct.pack_into('<I',b,20,9999)
++    with pytest.raises(ValueError):analyze_pcap(bytes(b),engine)
++    assert query_events(db_path=db)[1]==0
++
++
++def test_raw_ipv4_vlan_fragment_and_truncation():
++    ethernet=frame('192.0.2.1','198.51.100.2',17,1000,53,b'q')
++    raw=ethernet[14:];fields,_=decode_frame(raw,101,10)
++    assert fields['length']==len(raw) and fields['src_port']==1000
++    vlan=ethernet[:12]+b'\x81\x00\x00\x01\x08\x00'+raw
++    assert decode_frame(vlan,1,10)[0]['ttl']==64
++    fragment=bytearray(raw);fragment[6]=0x20
++    assert decode_frame(fragment,101,10)[1]=='fragment'
++    assert decode_frame(raw[:-1],101,10)[1]=='truncated'
++
++
++def test_actual_udp_probe_and_local_explanation(engine,db):
++    b=loopback_probe(engine,3)
++    assert b['stats']['datagrams_received']==6
++    assert all(x['spkts']==1 and x['dpkts']==1 for x in b['features'])
++    assert persist(b,db)==3 and persist(b,db)==0
++    rows,n=query_events(db_path=db,source='loopback_probe')
++    assert n==3 and source_totals(db).get('live',0)==0
++    for r in rows:
++        d=explain_observation(engine,r)
++        assert d['base']+sum(x['Change in attack score (points)'] for x in d['contributions'])/100==pytest.approx(d['score'])
++        with pytest.raises(ValueError,match='differs'):explain_observation(engine,{**r,'model_version':'old'})
++    with pytest.raises(ValueError):loopback_probe(engine,26)
++
++
++def test_batched_predictions_match_frozen_encoder_and_estimator(engine):
++    df=pd.read_csv(config.UNSW_TEST_PATH).head(12);df.loc[0,'service']='unseen-xyz'
++    preds,scores=engine.predict_many(df)
++    for i,row in enumerate(df.to_dict('records')):
++        f=dict(row);f['proto']='other' if f['proto'] in engine.rare_proto_values else f['proto']
++        for k,enc in engine.categorical_encoders.items():
++            v=str(f[k]);f[k]=enc.transform([v if v in enc.classes_ else '__unknown__'])[0]
++        f.update(zip(engine.numeric_features,engine.scaler.transform(pd.DataFrame([f])[engine.numeric_features])[0]))
++        v=np.array([[f[n] for n in engine.selected_features]])
++        label=engine.model.predict(v)[0]
++        assert preds[i]==label and scores[i]==pytest.approx(engine.model.predict_proba(v)[0,list(engine.model.classes_).index(label)])
++
++
++def test_timezone_bucket_invalid_and_legacy_rows():
++    rows=[{'timestamp':v,'prediction':'normal'} for v in ['2026-01-01T03:20:00+03:00','2026-01-01T00:10:00','bad']]
++    assert hourly_counts(rows)==({'2026-01-01 00:00Z':{'normal':2}},1)
++
++
++@pytest.mark.parametrize("name",['matched-20261031','budget-20261101','reference-20261101'])
++def test_evidence_bundle_corresponds_to_completed_run(name):
++    folder=ROOT/'outputs'/'benchmarks'/name;report=read_run(folder);table=comparison(report)
++    ref=name.startswith('reference-')
++    assert len(convergence(folder))==(40 if ref else 120)
++    with zipfile.ZipFile(folder/'research_evidence.zip') as z:
++        assert z.testzip() is None
++        assert len([n for n in z.namelist() if n.startswith('confusion_matrices/')])==len(table)
++        assert {'comparison_table.md','data_profile.csv','gwo_convergence.png','selected_features.csv'}.issubset(z.namelist())
++        with z.open('comparison_table.csv') as f:
++            csv=pd.read_csv(f);assert np.allclose(csv.accuracy_pct,table.accuracy_pct)
++        assert sum(r['candidate_features']==42 for r in report['results'])==(len(table) if ref else len(table)//2)
++    if ref:
++        for row in report['results']:
++            assert sum(map(sum,row['strict_test']['confusion_matrix']))==report['splits']['strict_test_rows']
++
++
++def test_workspaces_research_and_measured_flow_save(trained_bundle):
++    app=AppTest.from_file(str(ROOT/'dashboard'/'app.py'),default_timeout=30).run()
++    nav=lambda name:app.sidebar.radio[0].set_value(name).run()
++    nav('Research results');assert not app.exception
++    assert any('feature' in str(x.value).lower() for x in app.markdown)
++    next(b for b in app.selectbox if b.label=='Completed experiment').set_value(ROOT/'outputs'/'benchmarks'/'reference-20261101').run()
++    assert not app.exception and any('overlapping rows' in m.value for m in app.warning)
++    nav('Traffic lab')
++    next(b for b in app.button if b.label=='Measure local traffic').click().run()
++    assert not app.exception
++    next(b for b in app.button if b.label=='Save measured flows').click().run()
++    assert app.success and query_events(source='loopback_probe')[1]>=4
++    app.main.radio[0].set_value('Recorded PCAP').run();app.checkbox[0].check().run()
++    next(b for b in app.button if b.label=='Analyze recorded capture').click().run()
++    assert not app.exception and app.session_state['traffic_result_pcap_replay']['stats']['flows']==2
++    app.main.radio[0].set_value('Passive interface').run();assert not app.exception
++
++
++def test_compact_bundle_matches_validation_rule_and_alert_matrix(monkeypatch):
++    from src.runtime.inference import RuntimeInferenceEngine
++    folder=ROOT/'outputs/benchmarks/budget-20261101'
++    bundle=ROOT/'artifacts/compact20'
++    report=json.loads((bundle/'training_config.json').read_text())
++    trace=convergence(folder)
++    best=trace[(trace.pool=='runtime_35')&(trace.iteration==20)].sort_values(['fitness','seed'],ascending=[False,True]).iloc[0]
++    assert report['random_seed']==best.seed
++    monkeypatch.setattr(config,'SAVED_MODELS_DIR',str(bundle))
++    for attr,n in {'MODEL_PATH':'model.pkl','ENCODER_PATH':'encoder.pkl','SCALER_PATH':'scaler.pkl',
++                   'LABEL_ENCODER_PATH':'label_encoder.pkl','FEATURE_SCHEMA_PATH':'feature_schema.json'}.items():
++        monkeypatch.setattr(config,attr,str(bundle/n))
++    engine=RuntimeInferenceEngine();assert len(engine.selected_features)==20
++    assert engine.alert_threshold==report['calibration_alert_threshold']
++    assert report['model_version']==engine.schema['model_version']
++    audit=json.loads((ROOT/'outputs/audits'/(engine.schema['model_version']+'.json')).read_text())
++    normal=[g for g in audit['groups'] if not g['actual_label']]
++    attacks=[g for g in audit['groups'] if g['actual_label']]
++    m=report['held_out_alert_metrics']['confusion_matrix']
++    assert m[0][1]==sum(g['model_alerts'] for g in normal)
++    assert m[1][1]==sum(g['model_alerts'] for g in attacks)
++    assert sum(map(sum,m))==audit['test_rows']==53915
++
++
++def test_runtime_alert_threshold_and_record_time_are_preserved(db):
++    from src.runtime.alerting import record_event
++    for thresh in [.6,.8]:
++        record_event(1,.72,{'proto':'tcp'},{'dur':1},db_path=db,source='live',
++                     observed_at='2026-01-01T00:00:00+00:00',alert_threshold=thresh)
++    rows,total=query_events(source='live',db_path=db)
++    assert total==2 and [r['is_alert'] for r in rows]==[0,1]
++    assert all(r['observed_at'].startswith('2026-01-01') for r in rows)
++
++
++def test_compact_profile_training_is_guarded(monkeypatch):
++    import train
++    monkeypatch.setattr(config,'SAVED_MODELS_DIR',str(ROOT/'artifacts/compact20'))
++    with pytest.raises(ValueError,match='read-only'):train.run_training(quick=True)
++
++
++def test_parallel_schema_initialization_preserves_old_events(tmp_path):
++    import sqlite3
++    from contextlib import closing
++    from concurrent.futures import ThreadPoolExecutor
++    from src.runtime.alerting import _SCHEMA,init_db
++    db=str(tmp_path/'legacy.db')
++    with closing(sqlite3.connect(db)) as conn,conn:
++        conn.executescript(_SCHEMA);conn.execute("INSERT INTO events(timestamp,prediction,confidence) VALUES ('2025-01-01','normal',.9)")
++    with ThreadPoolExecutor(max_workers=3) as threads:
++        list(threads.map(lambda _:init_db(db),range(3)))
++    rows,n=query_events(source='legacy',db_path=db)
++    assert n==1 and rows[0]['observed_at'] is None and rows[0]['batch_id'] is None
+--- /dev/null
++++ b/traffic.py
+@@ -0,0 +1,22 @@
++"""Classify a bounded local UDP probe or authorized classic PCAP with the saved model."""
++import argparse
++import json
++from pathlib import Path
++from src.runtime.alerting import init_db
++from src.runtime.batch import MAX_BYTES
++from src.runtime.inference import RuntimeInferenceEngine
++from src.runtime.traffic_lab import loopback_probe, analyze_pcap, persist
++
++if __name__=="__main__":
++    p=argparse.ArgumentParser(description=__doc__)
++    mode=p.add_mutually_exclusive_group(required=True)
++    mode.add_argument('--probe',type=int,metavar="EXCHANGES");mode.add_argument('--pcap',type=Path)
++    p.add_argument('--save',action='store_true',help='persist observations to the configured event database')
++    a=p.parse_args();engine=RuntimeInferenceEngine()
++    if a.pcap:
++        with a.pcap.open('rb') as f:batch=analyze_pcap(f.read(MAX_BYTES+1),engine)
++    else:batch=loopback_probe(engine,a.probe)
++    summary={"source":batch["source"],"model":batch["version"],**batch["stats"],
++             "predictions":batch["results"].to_dict("records"),"stored":0}
++    if a.save:init_db();summary["stored"]=persist(batch)
++    print(json.dumps(summary,indent=2))
+--- a/train.py
++++ b/train.py
+@@ -371,6 +371,8 @@
+ 
+ def run_training(quick: bool = False) -> None:
+     """Serialize writers; inference refuses a bundle while it is being updated."""
++    if Path(config.SAVED_MODELS_DIR).resolve() == (Path(config.BASE_DIR)/"artifacts"/"compact20").resolve():
++        raise ValueError("The packaged compact20 profile is read-only. Use build_candidate.py with a new directory.")
+     from src.runtime.training_lock import training_lock
+     with training_lock(config.SAVED_MODELS_DIR):
+         previous_rf = config.RANDOM_FOREST_PARAMS
+--- /dev/null
++++ b/verify_capture.py
+@@ -0,0 +1,40 @@
++"""Bounded passive-collector verification on an explicitly chosen, authorized interface."""
++import argparse
++import json
++import os
++from pathlib import Path
++import sqlite3
++import subprocess
++import sys
++import tempfile
++from contextlib import closing
++
++ROOT=Path(__file__).resolve().parent
++
++def verify(iface, seconds=30):
++    if not iface.strip() or not 1 <= seconds <= 300: raise ValueError("Choose an interface and 1–300 seconds.")
++    with tempfile.TemporaryDirectory(prefix="gwo-capture-") as directory:
++        db=Path(directory)/"capture.db"
++        env={**os.environ,"IDS_DB_PATH":str(db)}
++        cmd=[sys.executable,"-u","realtime.py","--iface",iface,"--duration",str(seconds)]
++        try:
++            proc=subprocess.run(cmd,cwd=ROOT,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
++                                text=True,errors="replace",timeout=seconds+40)
++        except subprocess.TimeoutExpired:
++            return {"status":"timed_out","passive_capture_verified":False,"live_rows":0}
++        rows=0;heartbeat=None
++        if db.exists():
++            with closing(sqlite3.connect(db)) as conn:
++                rows=conn.execute("SELECT COUNT(*) FROM events WHERE source='live' AND observed_at IS NOT NULL").fetchone()[0]
++                heartbeat=conn.execute("SELECT status FROM collector_health WHERE id=1").fetchone()
++        ok=proc.returncode==0 and rows>0 and heartbeat==('stopped',)
++        return {"status":"verified" if ok else ("collector_failed" if proc.returncode else "no_verified_flows"),
++                "passive_capture_verified":ok,"live_rows":rows,"exit_code":proc.returncode,
++                "last_heartbeat":heartbeat[0] if heartbeat else None,
++                "diagnostic":None if proc.returncode==0 else "\n".join(proc.stdout.splitlines()[-4:])}
++
++if __name__=="__main__":
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--iface',required=True);p.add_argument('--seconds',type=int,default=30)
++    a=p.parse_args();result=verify(a.iface,a.seconds);print(json.dumps(result,indent=2))
++    raise SystemExit(0 if result['passive_capture_verified'] else 1)

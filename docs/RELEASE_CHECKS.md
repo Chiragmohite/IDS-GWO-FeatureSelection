@@ -1,0 +1,18 @@
+# Release checks — 1 November 2026
+
+## Final tests and integration
+
+- Baseline: 61 passed. Full final suite: **80 passed, 0 failed, 0 skipped in 6.85s**, Linux/Python 3.12.14, using the project's pinned dependencies. ResourceWarnings and PytestUnraisableExceptionWarnings treated as errors.
+- Commands: `../../verify-env/bin/python -m pytest -q -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning`; `python -m compileall -q src dashboard tests scripts *.py`; `node --check scripts/browser_smoke.cjs`; `python -m pip check`. Compilation and JavaScript syntax checks succeeded; no broken Python requirements.
+- Tests cover the 42/35 and reference research exports, exact-budget enforcement, calibration group separation, malformed PCAPs and fragmentation, replay-time flow expiration, event source and timestamp preservation, idempotent imports, simultaneous SQLite upgrades, actual socket exchanges, per-observation score reconstruction, correct alert cutoffs, candidate validation selection, frozen-model protection, saved audit matrices, and seven-workspace integration.
+- Actual browser command: `IDS_CHROMIUM_EXECUTABLE=<local Chromium 131 binary> IDS_BROWSER_OUTPUT=<temporary directory> ../../verify-env/bin/python scripts/browser_verify.py`, repeated with `IDS_MODEL_PROFILE=compact20`. Both exited 0. Both verified seven pages, 50 classified CSV flows saved, two concurrent populated sessions and refresh, evidence ZIP download, four actual localhost probe flows and two synthetic-PCAP fixture flows saved, a matching-model explanation, HTTP health 200, zero page errors and no mobile overflow. The reference-direction UI was also verified with AppTest.
+- Default and compact model audits evaluated 53,915 labelled records using the actual saved model pipelines, independently of Model lab's prior quick report. Compact20's rebuilt threshold and alert confusion matrix matched its research run. The default bundle's bytes match v4.
+- Separate CLI runs persisted six real UDP exchanges for the default profile and five for compact20. Each profile also processed and saved two flows from the bounded teaching PCAP. Compact-profile replay stored 100 benchmark observations (63 attack predictions, 58 model alerts); synthetic self-test stored one observation. These are input-path checks, not live attack evaluations.
+- The passive loopback adapter verifier returned exit 1: OS permission denied and zero live rows. Windows/PowerShell and Npcap are not present in this environment. This does not invalidate the verified socket probe or file replay; they use different source labels. Passive verification must be completed on an authorized target machine.
+- Original matched run, new budget run, reference-direction run, and verification/fix details are documented in MAJOR_PROJECT_GUIDE.md and VERIFICATION.md. Results are measured on the supplied data; there is no guarantee of production reliability or superiority over an uninspected code revision.
+
+## Safe upgrades
+
+Back up any local changes and event database before updating an existing installation. Do not remove your .venv312, logs or custom models. The added SQLite columns observed_at and batch_id are nullable and additive, and old rows remain searchable. Copy the new complete source/test directories and compact20 bundle from the ZIP. For clean setup the ZIP can be extracted in a fresh folder; the project expects Python 3.12. The compact model is optional, and the original default remains available.
+
+The supplied model files are models generated for this project. Only load trusted locally trained bundles. A checksum detects mismatching files; it is not a signature authenticating third-party files.

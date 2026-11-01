@@ -1,0 +1,184 @@
+{
+  "trained_at_utc": "2026-10-30T16:16:23.880881+00:00",
+  "dataset": "UNSW-NB15",
+  "train_rows": 3000,
+  "fit_rows": 2400,
+  "validation_rows": 600,
+  "removed_test_overlaps": 0,
+  "quick_mode": true,
+  "selection_data": "training-only stratified validation; final test excluded",
+  "sklearn_version": "1.8.0",
+  "duration_seconds": 2.74,
+  "test_rows": 1000,
+  "classifier": "random_forest",
+  "classification_mode": "binary",
+  "gwo_variant": "bGWO",
+  "gwo_population_size": 4,
+  "gwo_max_iterations": 3,
+  "gwo_runs": 1,
+  "fitness_alpha": 0.6,
+  "fitness_beta": 0.4,
+  "random_seed": 42,
+  "n_features_total_runtime_feasible": 35,
+  "n_features_selected": 33,
+  "baseline_accuracy": 83.0,
+  "gwo_selected_accuracy": 81.5,
+  "aap_average_accuracy_performance": 92.33333333333333,
+  "anf_average_num_features": 33.0,
+  "baseline_report": {
+    "0": {
+      "precision": 0.9762419006479481,
+      "recall": 0.7397708674304418,
+      "f1-score": 0.8417132216014898,
+      "support": 611.0
+    },
+    "1": {
+      "precision": 0.7039106145251397,
+      "recall": 0.9717223650385605,
+      "f1-score": 0.816414686825054,
+      "support": 389.0
+    },
+    "accuracy": 0.83,
+    "macro avg": {
+      "precision": 0.8400762575865439,
+      "recall": 0.8557466162345011,
+      "f1-score": 0.8290639542132718,
+      "support": 1000.0
+    },
+    "weighted avg": {
+      "precision": 0.8703050303461757,
+      "recall": 0.83,
+      "f1-score": 0.8318720915734562,
+      "support": 1000.0
+    }
+  },
+  "selected_report": {
+    "0": {
+      "precision": 0.959051724137931,
+      "recall": 0.7283142389525368,
+      "f1-score": 0.827906976744186,
+      "support": 611.0
+    },
+    "1": {
+      "precision": 0.6902985074626866,
+      "recall": 0.9511568123393316,
+      "f1-score": 0.8,
+      "support": 389.0
+    },
+    "accuracy": 0.815,
+    "macro avg": {
+      "precision": 0.8246751158003088,
+      "recall": 0.8397355256459342,
+      "f1-score": 0.813953488372093,
+      "support": 1000.0
+    },
+    "weighted avg": {
+      "precision": 0.854506722851261,
+      "recall": 0.815,
+      "f1-score": 0.8170511627906977,
+      "support": 1000.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      445,
+      166
+    ],
+    [
+      19,
+      370
+    ]
+  ],
+  "selected_features": [
+    "dur",
+    "proto",
+    "service",
+    "state",
+    "spkts",
+    "dpkts",
+    "sbytes",
+    "dbytes",
+    "rate",
+    "sttl",
+    "dttl",
+    "sload",
+    "dload",
+    "sinpkt",
+    "dinpkt",
+    "sjit",
+    "djit",
+    "swin",
+    "stcpb",
+    "dtcpb",
+    "dwin",
+    "tcprtt",
+    "synack",
+    "ackdat",
+    "smean",
+    "dmean",
+    "ct_srv_src",
+    "ct_state_ttl",
+    "ct_src_dport_ltm",
+    "ct_dst_sport_ltm",
+    "ct_src_ltm",
+    "ct_srv_dst",
+    "is_sm_ips_ports"
+  ],
+  "validation_scores": [
+    92.33333333333333
+  ],
+  "validation_feature_counts": [
+    33
+  ],
+  "feature_importance": {
+    "dur": 0.023483894936891674,
+    "proto": 0.001871364108417492,
+    "service": 0.004483369334036431,
+    "state": 0.02318932614227447,
+    "spkts": 0.011358722275328411,
+    "dpkts": 0.03764194385574607,
+    "sbytes": 0.03708950493225234,
+    "dbytes": 0.03405881592420061,
+    "rate": 0.01680509094048122,
+    "sttl": 0.14686245516614888,
+    "dttl": 0.055731390536733136,
+    "sload": 0.029764455956935543,
+    "dload": 0.06160551660048854,
+    "sinpkt": 0.022845075103430975,
+    "dinpkt": 0.037248597373098935,
+    "sjit": 0.01888359713474263,
+    "djit": 0.00998459969031302,
+    "swin": 0.0035676231339232096,
+    "stcpb": 0.011147968913011808,
+    "dtcpb": 0.012052779389904246,
+    "dwin": 0.0003593774282903034,
+    "tcprtt": 0.04204410985488469,
+    "synack": 0.020001205934805925,
+    "ackdat": 0.041451153421119,
+    "smean": 0.02831162223078626,
+    "dmean": 0.03800423876312876,
+    "ct_srv_src": 0.03321265336396814,
+    "ct_state_ttl": 0.12850503934458773,
+    "ct_src_dport_ltm": 0.009812848989901427,
+    "ct_dst_sport_ltm": 0.0046556035851946925,
+    "ct_src_ltm": 0.00926194224823698,
+    "ct_srv_dst": 0.0428385892029311,
+    "is_sm_ips_ports": 0.001865524183805366
+  },
+  "artifact_sha256": {
+    "model.pkl": "e376546e02e0ed56c3c82bc005f39da70685808c805d70de9cf572d619c8f8fe",
+    "encoder.pkl": "5022d3708ae0c8b44cd7035afbc0d6c2f27093a890002c104708a303a3698b1e",
+    "scaler.pkl": "7359869bbc2d16c51aa6c7427705750c18663504bb8d707581ff84286f26a37d",
+    "label_encoder.pkl": "b32f94f08c10f9e26682d050f9b7530b260af69b06648ad3da4ce4d69555dd6a",
+    "feature_schema.json": "23cc371f9704cde10b1570efb91782bda84c7b579df5e4dc7e0f217ea2c745a9"
+  },
+  "binary_metrics": {
+    "TP": 370,
+    "FP": 166,
+    "TN": 445,
+    "FN": 19,
+    "false_positive_rate": 0.27168576104746317,
+    "false_negative_rate": 0.04884318766066838,
+    "roc_auc": 0.936168109088308
+  }
+}
